@@ -34,6 +34,7 @@
 #include "xfs_health.h"
 #include "xfs_trace.h"
 #include "xfs_ag.h"
+#include "xfs_wicache.h"
 #include "scrub/stats.h"
 
 static DEFINE_MUTEX(xfs_uuid_table_mutex);
@@ -984,6 +985,14 @@ xfs_mountfs(
 			goto out_agresv;
 	}
 
+#ifdef USE_WICACHE
+	mp->m_wicache = xfs_wicache_mount_alloc(GFP_KERNEL);
+	if (IS_ERR(mp->m_wicache)) {
+		xfs_warn(mp, "WICache init failed, continue with native buffered I/O.");
+		mp->m_wicache = NULL;
+	}
+#endif
+
 	return 0;
 
  out_agresv:
@@ -1072,6 +1081,11 @@ xfs_unmountfs(
 	xfs_unmount_flush_inodes(mp);
 
 	xfs_qm_unmount(mp);
+
+#ifdef USE_WICACHE
+	xfs_wicache_mount_free(mp->m_wicache);
+	mp->m_wicache = NULL;
+#endif
 
 	/*
 	 * Unreserve any blocks we have so that when we unmount we don't account

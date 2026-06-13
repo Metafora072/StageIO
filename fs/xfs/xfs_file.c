@@ -24,6 +24,7 @@
 #include "xfs_pnfs.h"
 #include "xfs_iomap.h"
 #include "xfs_reflink.h"
+#include "xfs_wicache.h"
 
 #include <linux/dax.h>
 #include <linux/falloc.h>
@@ -31,6 +32,8 @@
 #include <linux/mman.h>
 #include <linux/fadvise.h>
 #include <linux/mount.h>
+#include <linux/slab.h>
+#include <linux/uio.h>
 
 static const struct vm_operations_struct xfs_file_vm_ops;
 
@@ -298,6 +301,198 @@ xfs_file_dax_read(
 	return ret;
 }
 
+#ifdef USE_WICACHE
+/*
+ * 释放 xfs_wicache_entry 数组中的每个 entry 引用，并释放数组本身。
+ */
+static void
+xfs_file_wicache_put_entries(
+	struct xfs_wicache_entry	**entries,
+	unsigned long				nr_entries)
+{
+	unsigned long				i;
+
+	if (!entries)
+		return;
+
+	for (i = 0; i < nr_entries; i++)
+		xfs_wicache_entry_put(entries[i]);
+	kvfree(entries);
+}
+
+/*
+ * 检查 pos 到 pos + count 范围内的每个 page 是否都能在 WICache 中找到有效 entry。
+ * 如果完全命中，则返回包含这些 entry 指针的数组，并通过 nr_entries 输出 entry 数量。
+ * 如果未完全命中，则返回 NULL。
+ */
+static struct xfs_wicache_entry **
+xfs_file_wicache_collect_full_hit(
+	struct xfs_wicache_inode	*wi,
+	loff_t						pos,
+	size_t						count,
+	unsigned long				*nr_entries)
+{
+	struct xfs_wicache_entry	**entries;
+	pgoff_t						first = pos >> PAGE_SHIFT;
+	pgoff_t						last = (pos + count - 1) >> PAGE_SHIFT;
+	unsigned long				nr = last - first + 1;
+	unsigned long				i;
+
+	*nr_entries = 0;
+	entries = kvcalloc(nr, sizeof(*entries), XFS_WICACHE_ACCOUNT_GFP(GFP_KERNEL));
+	if (!entries)
+		return NULL;
+
+	for (i = 0; i < nr; i++) {
+		entries[i] = xfs_wicache_lookup(wi, first + i);
+		if (!entries[i]) {
+			xfs_file_wicache_put_entries(entries, i);
+			return NULL;
+		}
+	}
+
+	*nr_entries = nr;
+	return entries;
+}
+
+/*
+ * 从 WICache 中完全命中的 entry 数组中拷贝数据到用户 buffer。
+ * 返回实际拷贝的字节数或错误码。
+ */
+static ssize_t
+xfs_file_wicache_copy_full_hit(
+	struct kiocb				*iocb,
+	struct iov_iter				*to,
+	struct xfs_wicache_entry 	**entries,
+	unsigned long				nr_entries,
+	loff_t						pos,
+	size_t						count)
+{
+	size_t						done = 0;
+	unsigned long				i;
+
+	for (i = 0; i < nr_entries && done < count; i++) {
+		size_t		offset = offset_in_page(pos + done);
+		size_t		bytes = min_t(size_t, PAGE_SIZE - offset, count - done);
+		size_t		copied;
+
+		copied = xfs_wicache_copy_to_iter(entries[i], offset, bytes, to);
+		iocb->ki_pos += copied;
+		done += copied;
+
+		if (copied != bytes)
+			return done ? done : -EFAULT;
+	}
+
+	return done;
+}
+
+/*
+ * 将 pos 到 pos + count 范围内命中的 WICache entry 中的脏数据覆盖到用户 buffer。
+ * 返回覆盖的字节数或错误码。
+ */
+static ssize_t
+xfs_file_wicache_overlay_dirty(
+	struct xfs_wicache_inode	*wi,
+	struct iov_iter				*to,
+	loff_t						pos,
+	size_t						count)
+{
+	struct iov_iter				overlay = *to;
+	size_t						done = 0;
+
+	iov_iter_truncate(&overlay, count);
+
+	// 逐页拷贝
+	while (done < count) {
+		struct xfs_wicache_entry *entry;
+		pgoff_t		page_index = (pos + done) >> PAGE_SHIFT;
+		size_t		offset = offset_in_page(pos + done);
+		size_t		bytes = min_t(size_t, PAGE_SIZE - offset, count - done);
+
+		entry = xfs_wicache_lookup(wi, page_index);
+		if (!entry) {
+			iov_iter_advance(&overlay, bytes);
+			done += bytes;
+			continue;
+		}
+
+		if (xfs_wicache_copy_to_iter(entry, offset, bytes, &overlay) != bytes) {
+			xfs_wicache_entry_put(entry);
+			return -EFAULT;
+		}
+		xfs_wicache_entry_put(entry);
+		done += bytes;
+	}
+
+	return count;
+}
+
+/*
+ * WICache Buffered Read 入口。
+ */
+static ssize_t
+xfs_file_wicache_read(
+	struct kiocb				*iocb,
+	struct iov_iter				*to)
+{
+	struct inode				*inode = file_inode(iocb->ki_filp);
+	struct xfs_inode			*ip = XFS_I(inode);
+	struct xfs_wicache_mount 	*wm = ip->i_mount->m_wicache;
+	struct xfs_wicache_inode 	*wi;
+	struct xfs_wicache_entry 	**entries;
+	struct iov_iter				overlay_to = *to;
+	loff_t						pos = iocb->ki_pos;
+	size_t						count = iov_iter_count(to);
+	unsigned long				nr_entries = 0;
+	ssize_t						ret;
+
+	if (!wm || !wm->enabled)
+		return -EOPNOTSUPP;
+	if (!count)
+		return 0;
+	if (!user_backed_iter(to))
+		return -EOPNOTSUPP;
+
+	wi = xfs_wicache_inode_lookup(wm, ip);
+	if (!wi)
+		return -EOPNOTSUPP;
+
+	// 如果读范围完全命中 WICache，则直接从 WICache 拷贝到用户 buffer 即可
+	entries = xfs_file_wicache_collect_full_hit(wi, pos, count, &nr_entries);
+	if (entries) {
+		ret = xfs_file_wicache_copy_full_hit(iocb, to, entries, nr_entries, pos, count);
+		// 拷贝完成后释放在 collect 中获取的 entry 引用
+		xfs_file_wicache_put_entries(entries, nr_entries);
+		goto out_put;
+	}
+
+	// 读范围未完全命中 WICache，回退到原生 buffered read
+	// 并在读完后用 WICache 中的脏数据覆盖命中页
+	ret = xfs_ilock_iocb(iocb, XFS_IOLOCK_SHARED);
+	if (ret)
+		goto out_put;
+
+	ret = generic_file_read_iter(iocb, to);
+	xfs_iunlock(ip, XFS_IOLOCK_SHARED);
+
+	if (ret > 0) {
+		ssize_t		overlay_ret;
+
+		// WICache 中的脏数据覆盖命中页，返回覆盖的字节数或错误码
+		overlay_ret = xfs_file_wicache_overlay_dirty(wi, &overlay_to, pos, ret);
+		if (overlay_ret < 0)
+			ret = overlay_ret;
+	}
+
+out_put:
+	xfs_wicache_inode_put(wi);
+	if (ret > 0) // 更新访问时间戳
+		file_accessed(iocb->ki_filp);
+	return ret;
+}
+#endif /* USE_WICACHE */
+
 STATIC ssize_t
 xfs_file_buffered_read(
 	struct kiocb		*iocb,
@@ -307,6 +502,13 @@ xfs_file_buffered_read(
 	ssize_t			ret;
 
 	trace_xfs_file_buffered_read(iocb, to);
+
+#ifdef USE_WICACHE
+	// 对于 buffered read，尝试走 WICache 路径，失败后再回退到原生 buffered read。
+	ret = xfs_file_wicache_read(iocb, to);
+	if (ret != -EOPNOTSUPP)
+		return ret;
+#endif
 
 	ret = xfs_ilock_iocb(iocb, XFS_IOLOCK_SHARED);
 	if (ret)
@@ -825,6 +1027,102 @@ out:
 	return ret;
 }
 
+
+/*
+ * WICache Buffered Write 入口。
+ */
+#ifdef USE_WICACHE
+static ssize_t
+xfs_file_wicache_write(
+	struct kiocb				*iocb,
+	struct iov_iter				*from)
+{
+	struct inode				*inode = iocb->ki_filp->f_mapping->host;
+	struct xfs_inode			*ip = XFS_I(inode);
+	struct xfs_wicache_mount 	*wm = ip->i_mount->m_wicache;
+	struct xfs_wicache_inode 	*wi;
+	unsigned int				iolock = XFS_IOLOCK_EXCL;
+	loff_t						pos;
+	size_t						count;
+	ssize_t						ret;
+	ssize_t						written = 0;
+
+	if (!wm || !wm->enabled || !xfs_wicache_can_stage(iocb, from))
+		return -EOPNOTSUPP;
+	if (xfs_has_wsync(ip->i_mount) || IS_SYNC(inode))
+		return -EOPNOTSUPP;
+
+	count = iov_iter_count(from);
+	if (iocb->ki_pos + count > i_size_read(inode))
+		return -EOPNOTSUPP;
+
+	// 先获取 iolock 并做写前检查，确保写入合法且可被 WICache 处理。
+	ret = xfs_ilock_iocb(iocb, iolock);
+	if (ret)
+		return ret;
+
+	ret = xfs_file_write_checks(iocb, from, &iolock);
+	if (ret)
+		goto out_unlock;
+
+	count = iov_iter_count(from);
+	if (!xfs_wicache_can_stage(iocb, from)){
+		ret = -EOPNOTSUPP;
+		goto out_unlock;
+	}
+
+	pos = iocb->ki_pos;
+	// 写前检查通过后立即释放 iolock，进入 WICache 写入过程。
+	xfs_iunlock(ip, iolock);
+	iolock = 0;
+
+	// 获取或创建 inode Cache
+	wi = xfs_wicache_inode_get_or_create(wm, ip, GFP_NOFS);
+	if (IS_ERR(wi))
+		return PTR_ERR(wi);
+
+	// 逐 4k 页处理
+	while (count >= PAGE_SIZE) {
+		struct folio	*folio;
+		pgoff_t			page_index = pos >> PAGE_SHIFT;
+
+		// 从用户 buffer 分配一个 folio，并把数据拷贝到 folio 中。
+		folio = xfs_wicache_alloc_folio_from_iter(from, GFP_NOFS);
+		if (IS_ERR(folio)) {
+			ret = PTR_ERR(folio);
+			break;
+		}
+
+		// 把 folio 中的数据封装成 entry 存到 WICache 中，并把 entry 标记为 dirty。
+		ret = xfs_wicache_store_folio(wi, page_index, folio, GFP_NOFS);
+		if (ret) { // store 失败，释放 folio 并退出循环
+			iov_iter_revert(from, PAGE_SIZE);
+			folio_put(folio);
+			break;
+		}
+
+		pos += PAGE_SIZE;
+		iocb->ki_pos += PAGE_SIZE;
+		count -= PAGE_SIZE;
+		written += PAGE_SIZE;
+	}
+
+	// 释放 WICache 引用
+	xfs_wicache_inode_put(wi);
+
+	if (written > 0) {
+		XFS_STATS_ADD(ip->i_mount, xs_write_bytes, written);
+		return written;
+	}
+	return ret;
+
+out_unlock:
+	if (iolock)
+		xfs_iunlock(ip, iolock);
+	return ret;
+}
+#endif /* USE_WICACHE */
+
 STATIC ssize_t
 xfs_file_write_iter(
 	struct kiocb		*iocb,
@@ -857,6 +1155,13 @@ xfs_file_write_iter(
 		if (ret != -ENOTBLK)
 			return ret;
 	}
+
+#ifdef USE_WICACHE
+	// 对于覆盖写，尝试走 WICache 路径，失败后再回退到原生 buffered write。
+	ret = xfs_file_wicache_write(iocb, from);
+	if (ret != -EOPNOTSUPP)
+		return ret;
+#endif
 
 	return xfs_file_buffered_write(iocb, from);
 }
