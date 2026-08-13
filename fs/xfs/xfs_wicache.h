@@ -27,6 +27,8 @@ struct xfs_inode;
 
 #define XFS_WICACHE_NR_SHARDS		64
 #define XFS_WICACHE_SHARD_MASK		(XFS_WICACHE_NR_SHARDS - 1)
+#define XFS_WICACHE_NR_ADMISSION_LOCKS	64
+#define XFS_WICACHE_ADMISSION_MASK	(XFS_WICACHE_NR_ADMISSION_LOCKS - 1)
 #define XFS_WICACHE_SEG_SHIFT		9
 #define XFS_WICACHE_SEG_SIZE		(1U << XFS_WICACHE_SEG_SHIFT)
 #define XFS_WICACHE_NR_SEGS		(PAGE_SIZE / XFS_WICACHE_SEG_SIZE)
@@ -103,6 +105,7 @@ struct xfs_wicache_mount {
 	bool				enabled;
 	struct rhashtable		inode_table;
 	struct mutex			inode_lock;
+	struct mutex			admission_locks[XFS_WICACHE_NR_ADMISSION_LOCKS];
 	struct list_head		inodes;
 	struct workqueue_struct		*control_wq;
 	struct workqueue_struct		*io_wq;
@@ -118,6 +121,8 @@ struct xfs_wicache_inode *xfs_wicache_inode_lookup(
 struct xfs_wicache_inode *xfs_wicache_inode_get_or_create(
 		struct xfs_wicache_mount *wm, struct xfs_inode *ip, gfp_t gfp);
 void xfs_wicache_inode_put(struct xfs_wicache_inode *wi);
+struct mutex *xfs_wicache_admission_lock(struct xfs_wicache_mount *wm,
+		struct xfs_inode *ip);
 
 bool xfs_wicache_can_stage(struct kiocb *iocb, struct iov_iter *from);
 ssize_t xfs_wicache_stage_iter(struct xfs_wicache_inode *wi,
@@ -130,6 +135,8 @@ bool xfs_wicache_range_has_entry(struct xfs_wicache_inode *wi,
 		loff_t pos, size_t count);
 void xfs_wicache_read_lock(struct xfs_wicache_inode *wi);
 void xfs_wicache_read_unlock(struct xfs_wicache_inode *wi);
+void xfs_wicache_record_front_iolock(u64 ns);
+void xfs_wicache_record_mapping_check(u64 ns);
 
 ssize_t xfs_wicache_dio_read_folio(struct file *file, loff_t pos,
 		struct folio *folio);

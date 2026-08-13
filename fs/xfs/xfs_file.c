@@ -31,6 +31,7 @@
 #include <linux/backing-dev.h>
 #include <linux/mman.h>
 #include <linux/fadvise.h>
+#include <linux/ktime.h>
 #include <linux/mount.h>
 #include <linux/slab.h>
 #include <linux/uio.h>
@@ -1009,6 +1010,37 @@ xfs_file_wicache_native_preferred(
 	return all_hot;
 }
 
+static bool
+xfs_file_wicache_written(
+	struct xfs_inode	*ip,
+	loff_t			pos,
+	size_t			count)
+{
+	struct xfs_mount	*mp = ip->i_mount;
+	xfs_fileoff_t		start = XFS_B_TO_FSBT(mp, pos);
+	xfs_fileoff_t		end = XFS_B_TO_FSB(mp, pos + count);
+	struct xfs_bmbt_irec	imap;
+	bool			written = true;
+
+	xfs_ilock(ip, XFS_ILOCK_SHARED);
+	while (start < end) {
+		int			nimaps = 1;
+
+		if (xfs_bmapi_read(ip, start, end - start, &imap, &nimaps, 0) ||
+		    nimaps != 1 || imap.br_startoff > start ||
+		    imap.br_startblock == HOLESTARTBLOCK ||
+		    imap.br_startblock == DELAYSTARTBLOCK ||
+		    isnullstartblock(imap.br_startblock) ||
+		    imap.br_state != XFS_EXT_NORM) {
+			written = false;
+			break;
+		}
+		start = min(end, imap.br_startoff + imap.br_blockcount);
+	}
+	xfs_iunlock(ip, XFS_ILOCK_SHARED);
+	return written;
+}
+
 static ssize_t
 xfs_file_wicache_write(
 	struct kiocb		*iocb,
@@ -1018,63 +1050,111 @@ xfs_file_wicache_write(
 	struct xfs_inode	*ip = XFS_I(inode);
 	struct xfs_wicache_mount *wm = ip->i_mount->m_wicache;
 	struct xfs_wicache_inode *wi;
-	unsigned int		iolock = XFS_IOLOCK_EXCL;
+	struct mutex		*admission;
+	unsigned int		iolock = XFS_IOLOCK_SHARED;
 	loff_t			pos;
 	size_t			count;
 	ssize_t			ret;
+	bool			has_entry;
+	bool			written;
+	u64			start;
 
-	if (!wm || !wm->enabled || !xfs_wicache_can_stage(iocb, from))
+	if (!wm || !wm->enabled)
 		return -EOPNOTSUPP;
-	if (xfs_has_wsync(ip->i_mount) || IS_SYNC(inode))
-		return -EOPNOTSUPP;
-	if (xfs_is_cow_inode(ip))
-		return -EOPNOTSUPP;
-
 	count = iov_iter_count(from);
-	if (iocb->ki_pos + count > i_size_read(inode))
-		return -EOPNOTSUPP;
-
+	pos = iocb->ki_pos;
+	admission = xfs_wicache_admission_lock(wm, ip);
+	mutex_lock(admission);
+	wi = xfs_wicache_inode_lookup(wm, ip);
+	has_entry = wi && xfs_wicache_range_has_entry(wi, pos, count);
+	if (!xfs_wicache_can_stage(iocb, from) ||
+	    xfs_has_wsync(ip->i_mount) || IS_SYNC(inode) ||
+	    xfs_is_cow_inode(ip) || pos + count > i_size_read(inode)) {
+		if (has_entry) {
+			ret = -EAGAIN;
+		} else if (iocb->ki_flags & IOCB_DIRECT) {
+			ret = xfs_file_dio_write(iocb, from);
+		} else {
+			ret = xfs_file_buffered_write(iocb, from);
+		}
+		goto out_admission;
+	}
+	if (!has_entry &&
+	    ((IS_ALIGNED(pos, PAGE_SIZE) && IS_ALIGNED(count, PAGE_SIZE)) ||
+	     xfs_file_wicache_native_preferred(iocb->ki_filp, pos, count))) {
+		ret = xfs_file_buffered_write(iocb, from);
+		goto out_admission;
+	}
+	if (fault_in_iov_iter_readable(from, count) == count) {
+		ret = -EFAULT;
+		goto out_admission;
+	}
+	start = ktime_get_ns();
 	ret = xfs_ilock_iocb(iocb, iolock);
+	xfs_wicache_record_front_iolock(ktime_get_ns() - start);
 	if (ret)
-		return ret;
+		goto out_admission;
+
+	has_entry = wi && xfs_wicache_range_has_entry(wi, pos, count);
+	if (has_entry && count > PAGE_SIZE - offset_in_page(pos)) {
+		ret = -EAGAIN;
+		goto out_unlock;
+	}
+	start = ktime_get_ns();
+	written = xfs_file_wicache_written(ip, pos, count);
+	if (has_entry && !written) {
+		xfs_wicache_record_mapping_check(ktime_get_ns() - start);
+		ret = -EAGAIN;
+		goto out_unlock;
+	}
+	if (!has_entry && !written) {
+		xfs_wicache_record_mapping_check(ktime_get_ns() - start);
+		xfs_iunlock(ip, iolock);
+		iolock = 0;
+		ret = xfs_file_buffered_write(iocb, from);
+		goto out_admission;
+	}
+	xfs_wicache_record_mapping_check(ktime_get_ns() - start);
+	if (!wi) {
+		wi = xfs_wicache_inode_get_or_create(wm, ip, GFP_NOFS);
+		if (IS_ERR(wi)) {
+			xfs_iunlock(ip, iolock);
+			iolock = 0;
+			ret = xfs_file_buffered_write(iocb, from);
+			wi = NULL;
+			goto out_admission;
+		}
+	}
 
 	ret = xfs_file_write_checks(iocb, from, &iolock);
 	if (ret)
 		goto out_unlock;
-
 	count = iov_iter_count(from);
 	if (!xfs_wicache_can_stage(iocb, from)) {
-		ret = -EOPNOTSUPP;
-		goto out_unlock;
-	}
-
-	pos = iocb->ki_pos;
-	wi = xfs_wicache_inode_lookup(wm, ip);
-	if ((!wi || !xfs_wicache_range_has_entry(wi, pos, count)) &&
-	    xfs_file_wicache_native_preferred(iocb->ki_filp, pos, count)) {
-		xfs_wicache_inode_put(wi);
-		ret = -EOPNOTSUPP;
-		goto out_unlock;
-	}
-	xfs_iunlock(ip, iolock);
-	iolock = 0;
-
-	if (!wi) {
-		wi = xfs_wicache_inode_get_or_create(wm, ip, GFP_NOFS);
-		if (IS_ERR(wi))
-			return PTR_ERR(wi);
+		if (has_entry) {
+			ret = -EAGAIN;
+			goto out_unlock;
+		}
+		xfs_iunlock(ip, iolock);
+		iolock = 0;
+		ret = xfs_file_buffered_write(iocb, from);
+		goto out_admission;
 	}
 	ret = xfs_wicache_stage_iter(wi, iocb->ki_filp, from, pos, count);
-	xfs_wicache_inode_put(wi);
+	xfs_iunlock(ip, iolock);
+	iolock = 0;
 	if (ret > 0) {
 		iocb->ki_pos += ret;
 		XFS_STATS_ADD(ip->i_mount, xs_write_bytes, ret);
 	}
-	return ret;
+	goto out_admission;
 
 out_unlock:
 	if (iolock)
 		xfs_iunlock(ip, iolock);
+out_admission:
+	mutex_unlock(admission);
+	xfs_wicache_inode_put(wi);
 	return ret;
 }
 #endif /* USE_WICACHE */
@@ -1100,6 +1180,16 @@ xfs_file_write_iter(
 	if (IS_DAX(inode))
 		return xfs_file_dax_write(iocb, from);
 
+#ifdef USE_WICACHE
+	/*
+	 * Check the overlay before direct and unsupported buffered writes so
+	 * that an overlapping request cannot bypass an existing dirty entry.
+	 */
+	ret = xfs_file_wicache_write(iocb, from);
+	if (ret != -EOPNOTSUPP)
+		return ret;
+#endif
+
 	if (iocb->ki_flags & IOCB_DIRECT) {
 		/*
 		 * Allow a directio write to fall back to a buffered
@@ -1111,13 +1201,6 @@ xfs_file_write_iter(
 		if (ret != -ENOTBLK)
 			return ret;
 	}
-
-#ifdef USE_WICACHE
-	// 对于覆盖写，尝试走 WICache 路径，失败后再回退到原生 buffered write。
-	ret = xfs_file_wicache_write(iocb, from);
-	if (ret != -EOPNOTSUPP)
-		return ret;
-#endif
 
 	return xfs_file_buffered_write(iocb, from);
 }
