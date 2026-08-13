@@ -15,6 +15,7 @@
 #include <linux/fs.h>
 #include <linux/highmem.h>
 #include <linux/jiffies.h>
+#include <linux/ktime.h>
 #include <linux/mm.h>
 #include <linux/moduleparam.h>
 #include <linux/pagemap.h>
@@ -37,6 +38,26 @@ static atomic64_t xfs_wicache_global_full_cancels;
 static atomic64_t xfs_wicache_global_device_read_bytes;
 static atomic64_t xfs_wicache_global_device_write_bytes;
 static atomic64_t xfs_wicache_global_flush_errors;
+static atomic64_t xfs_wicache_global_batches;
+static atomic64_t xfs_wicache_global_batch_pages;
+static atomic64_t xfs_wicache_global_dio_read_calls;
+static atomic64_t xfs_wicache_global_dio_read_pages;
+static atomic64_t xfs_wicache_global_dio_write_calls;
+static atomic64_t xfs_wicache_global_dio_write_pages;
+static atomic64_t xfs_wicache_global_dio_current;
+static atomic64_t xfs_wicache_global_dio_peak;
+static atomic64_t xfs_wicache_global_prepare_queue_ns;
+static atomic64_t xfs_wicache_global_prepare_ns;
+static atomic64_t xfs_wicache_global_dispatch_queue_ns;
+static atomic64_t xfs_wicache_global_dio_read_ns;
+static atomic64_t xfs_wicache_global_visibility_wait_ns;
+static atomic64_t xfs_wicache_global_dio_write_ns;
+static atomic64_t xfs_wicache_global_batch_active_peak;
+static atomic64_t xfs_wicache_global_scan_ns;
+static atomic64_t xfs_wicache_global_dispatch_ns;
+static atomic64_t xfs_wicache_global_finish_ns;
+static atomic64_t xfs_wicache_global_entry_bytes;
+static atomic64_t xfs_wicache_global_entry_peak_bytes;
 
 module_param_named(wicache_enable, xfs_wicache_enable, bool, 0644);
 MODULE_PARM_DESC(wicache_enable, "Enable experimental sparse write overlay");
@@ -81,6 +102,44 @@ module_param_cb(wicache_device_write_bytes, &xfs_wicache_atomic64_ops,
 		&xfs_wicache_global_device_write_bytes, 0444);
 module_param_cb(wicache_flush_errors, &xfs_wicache_atomic64_ops,
 		&xfs_wicache_global_flush_errors, 0444);
+module_param_cb(wicache_batches, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_batches, 0444);
+module_param_cb(wicache_batch_pages, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_batch_pages, 0444);
+module_param_cb(wicache_dio_read_calls, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_dio_read_calls, 0444);
+module_param_cb(wicache_dio_read_pages, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_dio_read_pages, 0444);
+module_param_cb(wicache_dio_write_calls, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_dio_write_calls, 0444);
+module_param_cb(wicache_dio_write_pages, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_dio_write_pages, 0444);
+module_param_cb(wicache_dio_peak, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_dio_peak, 0444);
+module_param_cb(wicache_prepare_queue_ns, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_prepare_queue_ns, 0444);
+module_param_cb(wicache_prepare_ns, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_prepare_ns, 0444);
+module_param_cb(wicache_dispatch_queue_ns, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_dispatch_queue_ns, 0444);
+module_param_cb(wicache_dio_read_ns, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_dio_read_ns, 0444);
+module_param_cb(wicache_visibility_wait_ns, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_visibility_wait_ns, 0444);
+module_param_cb(wicache_dio_write_ns, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_dio_write_ns, 0444);
+module_param_cb(wicache_batch_active_peak, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_batch_active_peak, 0444);
+module_param_cb(wicache_scan_ns, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_scan_ns, 0444);
+module_param_cb(wicache_dispatch_ns, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_dispatch_ns, 0444);
+module_param_cb(wicache_finish_ns, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_finish_ns, 0444);
+module_param_cb(wicache_entry_bytes, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_entry_bytes, 0444);
+module_param_cb(wicache_entry_peak_bytes, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_entry_peak_bytes, 0444);
 
 static const struct rhashtable_params xfs_wicache_inode_hash_params = {
 	.key_len		= sizeof(struct xfs_inode *),
@@ -93,6 +152,7 @@ struct xfs_wicache_batch {
 	struct work_struct		dispatch_work;
 	atomic_t			prepare_pending;
 	unsigned int			nr;
+	u64				dispatch_queued_ns;
 	struct xfs_wicache_entry	*entries[];
 };
 
@@ -130,6 +190,47 @@ xfs_wicache_update_peak(
 		if (seen == old)
 			break;
 		old = seen;
+	}
+}
+
+static void
+xfs_wicache_dio_start(void)
+{
+	s64			active, peak;
+
+	active = atomic64_inc_return(&xfs_wicache_global_dio_current);
+	peak = atomic64_read(&xfs_wicache_global_dio_peak);
+	while (active > peak) {
+		s64 seen = atomic64_cmpxchg(&xfs_wicache_global_dio_peak,
+				peak, active);
+
+		if (seen == peak)
+			break;
+		peak = seen;
+	}
+}
+
+static void
+xfs_wicache_dio_finish(void)
+{
+	atomic64_dec(&xfs_wicache_global_dio_current);
+}
+
+static void
+xfs_wicache_update_batch_peak(
+	s64			active)
+{
+	s64			peak;
+
+	peak = atomic64_read(&xfs_wicache_global_batch_active_peak);
+	while (active > peak) {
+		s64 seen = atomic64_cmpxchg(
+				&xfs_wicache_global_batch_active_peak,
+				peak, active);
+
+		if (seen == peak)
+			break;
+		peak = seen;
 	}
 }
 
@@ -195,6 +296,8 @@ xfs_wicache_entry_free_rcu(
 	if (entry->prepared_folio)
 		folio_put(entry->prepared_folio);
 	WARN_ON_ONCE(entry->io_file);
+	atomic64_sub(sizeof(*entry), &xfs_wicache_global_entry_bytes);
+	xfs_wicache_uncharge(entry->wi->wm, sizeof(*entry));
 	kfree(entry);
 }
 
@@ -214,10 +317,29 @@ xfs_wicache_entry_alloc(
 	gfp_t			gfp)
 {
 	struct xfs_wicache_entry *entry;
+	s64			entry_bytes, old;
+	int			error;
 
-	entry = kzalloc(sizeof(*entry), XFS_WICACHE_ACCOUNT_GFP(gfp));
-	if (!entry)
+	error = xfs_wicache_charge(wi->wm, sizeof(*entry), true);
+	if (error)
 		return NULL;
+	entry = kzalloc(sizeof(*entry), XFS_WICACHE_ACCOUNT_GFP(gfp));
+	if (!entry) {
+		xfs_wicache_uncharge(wi->wm, sizeof(*entry));
+		return NULL;
+	}
+	entry_bytes = atomic64_add_return(sizeof(*entry),
+			&xfs_wicache_global_entry_bytes);
+	old = atomic64_read(&xfs_wicache_global_entry_peak_bytes);
+	while (entry_bytes > old) {
+		s64 seen = atomic64_cmpxchg(
+				&xfs_wicache_global_entry_peak_bytes,
+				old, entry_bytes);
+
+		if (seen == old)
+			break;
+		old = seen;
+	}
 
 	entry->wi = wi;
 	entry->io_file = get_file(file);
@@ -225,7 +347,7 @@ xfs_wicache_entry_alloc(
 	entry->state = XFS_WICACHE_ENTRY_DIRTY;
 	refcount_set(&entry->refcount, 1);
 	mutex_init(&entry->lock);
-	INIT_LIST_HEAD(&entry->dirty_node);
+	RB_CLEAR_NODE(&entry->dirty_node);
 	INIT_WORK(&entry->prepare_work, xfs_wicache_entry_prepare_work);
 	return entry;
 }
@@ -235,8 +357,6 @@ xfs_wicache_init_shard(
 	struct xfs_wicache_shard *shard)
 {
 	xa_init(&shard->entries);
-	spin_lock_init(&shard->dirty_lock);
-	INIT_LIST_HEAD(&shard->dirty_list);
 }
 
 static void
@@ -290,8 +410,10 @@ xfs_wicache_destroy_shard(
 
 	xa_for_each(&shard->entries, index, entry) {
 		xa_erase(&shard->entries, index);
-		if (!list_empty(&entry->dirty_node))
-			list_del_init(&entry->dirty_node);
+		if (entry->on_dirty_tree) {
+			rb_erase_cached(&entry->dirty_node, &wi->dirty_tree);
+			entry->on_dirty_tree = false;
+		}
 		xfs_wicache_entry_drop_buffers(entry);
 		atomic64_dec(&wi->nr_entries);
 		xfs_wicache_entry_put(entry);
@@ -322,8 +444,8 @@ xfs_wicache_inode_alloc(
 	atomic_set(&wi->batch_active, 0);
 	wi->state = XFS_WICACHE_INODE_ACTIVE;
 	init_rwsem(&wi->visibility_sem);
-	mutex_init(&wi->scan_lock);
-	wi->flush_cursor = 0;
+	spin_lock_init(&wi->dirty_lock);
+	wi->dirty_tree = RB_ROOT_CACHED;
 	INIT_DELAYED_WORK(&wi->flush_work, xfs_wicache_inode_flush_work);
 	INIT_LIST_HEAD(&wi->mount_node);
 	refcount_set(&wi->refcount, 1);
@@ -380,6 +502,26 @@ xfs_wicache_reset_stats(void)
 	atomic64_set(&xfs_wicache_global_device_read_bytes, 0);
 	atomic64_set(&xfs_wicache_global_device_write_bytes, 0);
 	atomic64_set(&xfs_wicache_global_flush_errors, 0);
+	atomic64_set(&xfs_wicache_global_batches, 0);
+	atomic64_set(&xfs_wicache_global_batch_pages, 0);
+	atomic64_set(&xfs_wicache_global_dio_read_calls, 0);
+	atomic64_set(&xfs_wicache_global_dio_read_pages, 0);
+	atomic64_set(&xfs_wicache_global_dio_write_calls, 0);
+	atomic64_set(&xfs_wicache_global_dio_write_pages, 0);
+	atomic64_set(&xfs_wicache_global_dio_current, 0);
+	atomic64_set(&xfs_wicache_global_dio_peak, 0);
+	atomic64_set(&xfs_wicache_global_prepare_queue_ns, 0);
+	atomic64_set(&xfs_wicache_global_prepare_ns, 0);
+	atomic64_set(&xfs_wicache_global_dispatch_queue_ns, 0);
+	atomic64_set(&xfs_wicache_global_dio_read_ns, 0);
+	atomic64_set(&xfs_wicache_global_visibility_wait_ns, 0);
+	atomic64_set(&xfs_wicache_global_dio_write_ns, 0);
+	atomic64_set(&xfs_wicache_global_batch_active_peak, 0);
+	atomic64_set(&xfs_wicache_global_scan_ns, 0);
+	atomic64_set(&xfs_wicache_global_dispatch_ns, 0);
+	atomic64_set(&xfs_wicache_global_finish_ns, 0);
+	atomic64_set(&xfs_wicache_global_entry_bytes, 0);
+	atomic64_set(&xfs_wicache_global_entry_peak_bytes, 0);
 }
 
 struct xfs_wicache_mount *
@@ -622,17 +764,43 @@ retry:
 }
 
 static void
+xfs_wicache_dirty_insert(
+	struct xfs_wicache_inode *wi,
+	struct xfs_wicache_entry *entry)
+{
+	struct rb_node		**link = &wi->dirty_tree.rb_root.rb_node;
+	struct rb_node		*parent = NULL;
+	bool			leftmost = true;
+
+	while (*link) {
+		struct xfs_wicache_entry *other;
+
+		parent = *link;
+		other = rb_entry(parent, struct xfs_wicache_entry,
+				dirty_node);
+		if (entry->page_index < other->page_index) {
+			link = &parent->rb_left;
+		} else {
+			link = &parent->rb_right;
+			leftmost = false;
+		}
+	}
+	rb_link_node(&entry->dirty_node, parent, link);
+	rb_insert_color_cached(&entry->dirty_node, &wi->dirty_tree, leftmost);
+	entry->on_dirty_tree = true;
+}
+
+static void
 xfs_wicache_mark_dirty(
 	struct xfs_wicache_entry *entry)
 {
-	struct xfs_wicache_shard *shard = xfs_wicache_shard(entry->wi,
-			entry->page_index);
+	struct xfs_wicache_inode *wi = entry->wi;
 	unsigned long		delay;
 
-	spin_lock(&shard->dirty_lock);
-	if (!entry->queued && list_empty(&entry->dirty_node))
-		list_add_tail(&entry->dirty_node, &shard->dirty_list);
-	spin_unlock(&shard->dirty_lock);
+	spin_lock(&wi->dirty_lock);
+	if (!entry->queued && !entry->on_dirty_tree)
+		xfs_wicache_dirty_insert(wi, entry);
+	spin_unlock(&wi->dirty_lock);
 	delay = msecs_to_jiffies(xfs_wicache_delay_ms);
 	if (atomic64_read(&entry->wi->wm->total_dirty_bytes) >=
 	    xfs_wicache_high_bytes * 3 / 4)
@@ -837,6 +1005,28 @@ xfs_wicache_inode_has_dirty(
 	return atomic64_read(&wi->nr_entries) != 0;
 }
 
+bool
+xfs_wicache_range_has_entry(
+	struct xfs_wicache_inode *wi,
+	loff_t			pos,
+	size_t			count)
+{
+	pgoff_t			first = pos >> PAGE_SHIFT;
+	pgoff_t			last = (pos + count - 1) >> PAGE_SHIFT;
+	pgoff_t			index;
+
+	for (index = first; index <= last; index++) {
+		struct xfs_wicache_entry *entry;
+
+		entry = xfs_wicache_lookup_entry(wi, index);
+		if (!entry)
+			continue;
+		xfs_wicache_entry_put(entry);
+		return true;
+	}
+	return false;
+}
+
 void
 xfs_wicache_read_lock(
 	struct xfs_wicache_inode *wi)
@@ -916,14 +1106,13 @@ xfs_wicache_requeue_entry(
 	struct xfs_wicache_entry *entry,
 	bool			dirty)
 {
-	struct xfs_wicache_shard *shard = xfs_wicache_shard(entry->wi,
-			entry->page_index);
+	struct xfs_wicache_inode *wi = entry->wi;
 
-	spin_lock(&shard->dirty_lock);
+	spin_lock(&wi->dirty_lock);
 	entry->queued = false;
-	if (dirty && list_empty(&entry->dirty_node))
-		list_add_tail(&entry->dirty_node, &shard->dirty_list);
-	spin_unlock(&shard->dirty_lock);
+	if (dirty && !entry->on_dirty_tree)
+		xfs_wicache_dirty_insert(wi, entry);
+	spin_unlock(&wi->dirty_lock);
 }
 
 static void
@@ -1029,10 +1218,17 @@ xfs_wicache_entry_prepare_work(
 	struct xfs_wicache_entry *entry = container_of(work,
 			struct xfs_wicache_entry, prepare_work);
 	struct xfs_wicache_batch *batch = entry->batch;
+	u64			start = ktime_get_ns();
 
+	atomic64_add(start - READ_ONCE(entry->prepare_queued_ns),
+			&xfs_wicache_global_prepare_queue_ns);
 	xfs_wicache_prepare_entry(entry);
-	if (atomic_dec_and_test(&batch->prepare_pending))
+	atomic64_add(ktime_get_ns() - start,
+			&xfs_wicache_global_prepare_ns);
+	if (atomic_dec_and_test(&batch->prepare_pending)) {
+		batch->dispatch_queued_ns = ktime_get_ns();
 		queue_work(entry->wi->wm->io_wq, &batch->dispatch_work);
+	}
 }
 
 static void
@@ -1046,6 +1242,11 @@ xfs_wicache_batch_dispatch_work(
 	struct file		*file;
 	unsigned int		i, first, nr;
 	ssize_t			ret;
+	u64			dispatch_start = ktime_get_ns();
+	u64			start;
+
+	atomic64_add(ktime_get_ns() - batch->dispatch_queued_ns,
+			&xfs_wicache_global_dispatch_queue_ns);
 
 	folios = kcalloc(batch->nr, sizeof(*folios), GFP_NOFS);
 	if (!folios) {
@@ -1099,9 +1300,16 @@ xfs_wicache_batch_dispatch_work(
 			folios[nr] = entry->prepared_folio;
 			mutex_unlock(&entry->lock);
 		}
+		atomic64_inc(&xfs_wicache_global_dio_read_calls);
+		atomic64_add(nr, &xfs_wicache_global_dio_read_pages);
+		start = ktime_get_ns();
+		xfs_wicache_dio_start();
 		ret = xfs_wicache_dio_read_folios(file,
 				(loff_t)batch->entries[first]->page_index <<
 				PAGE_SHIFT, folios, nr);
+		xfs_wicache_dio_finish();
+		atomic64_add(ktime_get_ns() - start,
+				&xfs_wicache_global_dio_read_ns);
 		fput(file);
 		if (ret != (ssize_t)nr << PAGE_SHIFT)
 			ret = ret < 0 ? ret : -EIO;
@@ -1119,7 +1327,10 @@ xfs_wicache_batch_dispatch_work(
 		}
 	}
 
+	start = ktime_get_ns();
 	down_read(&wi->visibility_sem);
+	atomic64_add(ktime_get_ns() - start,
+			&xfs_wicache_global_visibility_wait_ns);
 	for (first = 0; first < batch->nr; first += nr) {
 		struct xfs_wicache_entry *entry = batch->entries[first];
 
@@ -1145,9 +1356,16 @@ xfs_wicache_batch_dispatch_work(
 			folios[nr] = entry->prepared_folio;
 			mutex_unlock(&entry->lock);
 		}
+		atomic64_inc(&xfs_wicache_global_dio_write_calls);
+		atomic64_add(nr, &xfs_wicache_global_dio_write_pages);
+		start = ktime_get_ns();
+		xfs_wicache_dio_start();
 		ret = xfs_wicache_dio_write_folios(file,
 				(loff_t)batch->entries[first]->page_index <<
 				PAGE_SHIFT, folios, nr);
+		xfs_wicache_dio_finish();
+		atomic64_add(ktime_get_ns() - start,
+				&xfs_wicache_global_dio_write_ns);
 		fput(file);
 		if (ret != (ssize_t)nr << PAGE_SHIFT)
 			ret = ret < 0 ? ret : -EIO;
@@ -1163,12 +1381,17 @@ xfs_wicache_batch_dispatch_work(
 	}
 	up_read(&wi->visibility_sem);
 
+	start = ktime_get_ns();
 	for (i = 0; i < batch->nr; i++)
 		xfs_wicache_finish_entry(batch->entries[i]);
+	atomic64_add(ktime_get_ns() - start,
+			&xfs_wicache_global_finish_ns);
 	kfree(folios);
 	atomic_dec(&wi->batch_active);
 	if (atomic64_read(&wi->nr_entries))
 		xfs_wicache_kick_inode(wi, 0);
+	atomic64_add(ktime_get_ns() - dispatch_start,
+			&xfs_wicache_global_dispatch_ns);
 	kfree(batch);
 }
 
@@ -1276,9 +1499,13 @@ xfs_wicache_inode_flush_work(
 			struct xfs_wicache_inode, flush_work);
 	struct xfs_wicache_batch *batch;
 	unsigned int		queued = 0, i;
-	unsigned long		next_index;
+	u64			scan_start;
+	int			active;
+	bool			more_dirty;
 
-	if (atomic_inc_return(&wi->batch_active) > xfs_wicache_qd) {
+	active = atomic_inc_return(&wi->batch_active);
+	xfs_wicache_update_batch_peak(active);
+	if (active > xfs_wicache_qd) {
 		atomic_dec(&wi->batch_active);
 		return;
 	}
@@ -1289,49 +1516,26 @@ xfs_wicache_inode_flush_work(
 		return;
 	}
 
-	mutex_lock(&wi->scan_lock);
-	next_index = wi->flush_cursor;
+	scan_start = ktime_get_ns();
+	spin_lock(&wi->dirty_lock);
 	while (queued < xfs_wicache_batch) {
-		struct xfs_wicache_entry *entry = NULL;
-		unsigned long		best = ULONG_MAX;
-		unsigned int		shard_id, best_shard = 0;
+		struct rb_node *node = rb_first_cached(&wi->dirty_tree);
+		struct xfs_wicache_entry *entry;
 
-		rcu_read_lock();
-		for (shard_id = 0; shard_id < XFS_WICACHE_NR_SHARDS;
-		     shard_id++) {
-			struct xfs_wicache_entry *candidate;
-			unsigned long index = next_index;
-
-			candidate = xa_find(&wi->shards[shard_id].entries,
-					&index, ULONG_MAX, XA_PRESENT);
-			if (candidate && index < best) {
-				entry = candidate;
-				best = index;
-				best_shard = shard_id;
-			}
-		}
-		if (entry && !xfs_wicache_entry_get(entry))
-			entry = NULL;
-		rcu_read_unlock();
-		if (!entry)
+		if (!node)
 			break;
-
-		next_index = best + 1;
-		spin_lock(&wi->shards[best_shard].dirty_lock);
-		if (entry->queued || list_empty(&entry->dirty_node)) {
-			spin_unlock(&wi->shards[best_shard].dirty_lock);
-			xfs_wicache_entry_put(entry);
-			continue;
-		}
-		list_del_init(&entry->dirty_node);
+		entry = rb_entry(node, struct xfs_wicache_entry, dirty_node);
+		if (WARN_ON_ONCE(!xfs_wicache_entry_get(entry)))
+			break;
+		rb_erase_cached(node, &wi->dirty_tree);
+		entry->on_dirty_tree = false;
 		entry->queued = true;
-		spin_unlock(&wi->shards[best_shard].dirty_lock);
 		batch->entries[queued++] = entry;
 	}
-	wi->flush_cursor = next_index;
-	if (!queued)
-		wi->flush_cursor = 0;
-	mutex_unlock(&wi->scan_lock);
+	more_dirty = !RB_EMPTY_ROOT(&wi->dirty_tree.rb_root);
+	spin_unlock(&wi->dirty_lock);
+	atomic64_add(ktime_get_ns() - scan_start,
+			&xfs_wicache_global_scan_ns);
 
 	if (!queued) {
 		kfree(batch);
@@ -1339,15 +1543,18 @@ xfs_wicache_inode_flush_work(
 		return;
 	}
 	batch->nr = queued;
+	atomic64_inc(&xfs_wicache_global_batches);
+	atomic64_add(queued, &xfs_wicache_global_batch_pages);
 	atomic_set(&batch->prepare_pending, queued);
 	INIT_WORK(&batch->dispatch_work, xfs_wicache_batch_dispatch_work);
 	for (i = 0; i < queued; i++) {
 		mutex_lock(&batch->entries[i]->lock);
 		batch->entries[i]->batch = batch;
+		batch->entries[i]->prepare_queued_ns = ktime_get_ns();
 		mutex_unlock(&batch->entries[i]->lock);
 		WARN_ON_ONCE(!queue_work(wi->wm->io_wq,
 				&batch->entries[i]->prepare_work));
 	}
-	if (atomic64_read(&wi->nr_entries) > queued)
+	if (more_dirty)
 		xfs_wicache_kick_inode(wi, 0);
 }

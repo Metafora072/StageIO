@@ -11,6 +11,7 @@
 #include <linux/rcupdate.h>
 #include <linux/refcount.h>
 #include <linux/rhashtable.h>
+#include <linux/rbtree.h>
 #include <linux/rwsem.h>
 #include <linux/spinlock.h>
 #include <linux/types.h>
@@ -63,18 +64,18 @@ struct xfs_wicache_entry {
 	u64				seq;
 	enum xfs_wicache_entry_state	state;
 	bool				queued;
+	bool				on_dirty_tree;
+	u64				prepare_queued_ns;
 
 	refcount_t			refcount;
 	struct mutex			lock;
-	struct list_head		dirty_node;
+	struct rb_node			dirty_node;
 	struct work_struct		prepare_work;
 	struct rcu_head			rcu;
 };
 
 struct xfs_wicache_shard {
 	struct xarray		entries;
-	spinlock_t		dirty_lock;
-	struct list_head	dirty_list;
 };
 
 struct xfs_wicache_inode {
@@ -91,8 +92,8 @@ struct xfs_wicache_inode {
 	enum xfs_wicache_inode_state	state;
 
 	struct rw_semaphore		visibility_sem;
-	struct mutex			scan_lock;
-	unsigned long			flush_cursor;
+	spinlock_t			dirty_lock;
+	struct rb_root_cached		dirty_tree;
 	struct delayed_work		flush_work;
 	refcount_t			refcount;
 	struct rcu_head			rcu;
@@ -125,6 +126,8 @@ ssize_t xfs_wicache_stage_iter(struct xfs_wicache_inode *wi,
 int xfs_wicache_overlay_iter(struct xfs_wicache_inode *wi,
 		struct iov_iter *to, loff_t pos, size_t count);
 bool xfs_wicache_inode_has_dirty(struct xfs_wicache_inode *wi);
+bool xfs_wicache_range_has_entry(struct xfs_wicache_inode *wi,
+		loff_t pos, size_t count);
 void xfs_wicache_read_lock(struct xfs_wicache_inode *wi);
 void xfs_wicache_read_unlock(struct xfs_wicache_inode *wi);
 

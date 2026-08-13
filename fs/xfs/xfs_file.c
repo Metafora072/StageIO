@@ -974,6 +974,41 @@ out:
  * WICache Buffered Write 入口。
  */
 #ifdef USE_WICACHE
+static bool
+xfs_file_wicache_native_preferred(
+	struct file		*file,
+	loff_t			pos,
+	size_t			count)
+{
+	struct address_space	*mapping = file->f_mapping;
+	pgoff_t			first = pos >> PAGE_SHIFT;
+	pgoff_t			last = (pos + count - 1) >> PAGE_SHIFT;
+	pgoff_t			index;
+	bool			all_hot = true;
+
+	for (index = first; index <= last; index++) {
+		struct folio *folio = filemap_get_folio(mapping, index);
+
+		if (IS_ERR(folio)) {
+			all_hot = false;
+			continue;
+		}
+		folio_lock(folio);
+		if (folio_mapping(folio) != mapping ||
+		    !folio_test_uptodate(folio)) {
+			all_hot = false;
+		} else if (folio_test_dirty(folio) ||
+			   folio_test_writeback(folio)) {
+			folio_unlock(folio);
+			folio_put(folio);
+			return true;
+		}
+		folio_unlock(folio);
+		folio_put(folio);
+	}
+	return all_hot;
+}
+
 static ssize_t
 xfs_file_wicache_write(
 	struct kiocb		*iocb,
@@ -1014,12 +1049,21 @@ xfs_file_wicache_write(
 	}
 
 	pos = iocb->ki_pos;
+	wi = xfs_wicache_inode_lookup(wm, ip);
+	if ((!wi || !xfs_wicache_range_has_entry(wi, pos, count)) &&
+	    xfs_file_wicache_native_preferred(iocb->ki_filp, pos, count)) {
+		xfs_wicache_inode_put(wi);
+		ret = -EOPNOTSUPP;
+		goto out_unlock;
+	}
 	xfs_iunlock(ip, iolock);
 	iolock = 0;
 
-	wi = xfs_wicache_inode_get_or_create(wm, ip, GFP_NOFS);
-	if (IS_ERR(wi))
-		return PTR_ERR(wi);
+	if (!wi) {
+		wi = xfs_wicache_inode_get_or_create(wm, ip, GFP_NOFS);
+		if (IS_ERR(wi))
+			return PTR_ERR(wi);
+	}
 	ret = xfs_wicache_stage_iter(wi, iocb->ki_filp, from, pos, count);
 	xfs_wicache_inode_put(wi);
 	if (ret > 0) {
