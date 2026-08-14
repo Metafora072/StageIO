@@ -66,6 +66,8 @@ static atomic64_t xfs_wicache_global_front_iolock_ns;
 static atomic64_t xfs_wicache_global_front_iolock_calls;
 static atomic64_t xfs_wicache_global_front_iolock_max_ns;
 static atomic64_t xfs_wicache_global_mapping_check_ns;
+static atomic64_t xfs_wicache_global_owner_file_refs;
+static atomic64_t xfs_wicache_global_temp_file_refs;
 
 module_param_named(wicache_enable, xfs_wicache_enable, bool, 0444);
 MODULE_PARM_DESC(wicache_enable, "Enable experimental sparse write overlay");
@@ -160,6 +162,42 @@ module_param_cb(wicache_front_iolock_max_ns, &xfs_wicache_atomic64_ops,
 		&xfs_wicache_global_front_iolock_max_ns, 0444);
 module_param_cb(wicache_mapping_check_ns, &xfs_wicache_atomic64_ops,
 		&xfs_wicache_global_mapping_check_ns, 0444);
+module_param_cb(wicache_owner_file_refs, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_owner_file_refs, 0444);
+module_param_cb(wicache_temp_file_refs, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_temp_file_refs, 0444);
+
+static struct file *
+xfs_wicache_owner_file_get(
+	struct file		*file)
+{
+	atomic64_inc(&xfs_wicache_global_owner_file_refs);
+	return get_file(file);
+}
+
+static void
+xfs_wicache_owner_file_put(
+	struct file		*file)
+{
+	atomic64_dec(&xfs_wicache_global_owner_file_refs);
+	fput(file);
+}
+
+static struct file *
+xfs_wicache_temp_file_get(
+	struct file		*file)
+{
+	atomic64_inc(&xfs_wicache_global_temp_file_refs);
+	return get_file(file);
+}
+
+static void
+xfs_wicache_temp_file_put(
+	struct file		*file)
+{
+	atomic64_dec(&xfs_wicache_global_temp_file_refs);
+	fput(file);
+}
 
 static const struct rhashtable_params xfs_wicache_inode_hash_params = {
 	.key_len		= sizeof(struct xfs_inode *),
@@ -366,7 +404,7 @@ xfs_wicache_entry_free_rcu(
 	if (entry->prepared_folio)
 		folio_put(entry->prepared_folio);
 	if (WARN_ON_ONCE(entry->io_file))
-		fput(entry->io_file);
+		xfs_wicache_owner_file_put(entry->io_file);
 	atomic64_sub(sizeof(*entry), &xfs_wicache_global_entry_bytes);
 	xfs_wicache_uncharge(entry->wi->wm, sizeof(*entry));
 	kfree(entry);
@@ -413,7 +451,7 @@ xfs_wicache_entry_alloc(
 	}
 
 	entry->wi = wi;
-	entry->io_file = get_file(file);
+	entry->io_file = xfs_wicache_owner_file_get(file);
 	entry->page_index = page_index;
 	entry->state = XFS_WICACHE_ENTRY_DIRTY;
 	refcount_set(&entry->refcount, 1);
@@ -468,7 +506,7 @@ xfs_wicache_entry_drop_buffers(
 	entry->state = XFS_WICACHE_ENTRY_INVALID;
 	mutex_unlock(&entry->lock);
 	if (file)
-		fput(file);
+		xfs_wicache_owner_file_put(file);
 }
 
 static void
@@ -885,7 +923,7 @@ retry:
 		struct file *held = entry->io_file;
 
 		entry->io_file = NULL;
-		fput(held);
+		xfs_wicache_owner_file_put(held);
 		xfs_wicache_entry_put(entry);
 		return ERR_PTR(xa_err(old));
 	}
@@ -893,7 +931,7 @@ retry:
 		struct file *held = entry->io_file;
 
 		entry->io_file = NULL;
-		fput(held);
+		xfs_wicache_owner_file_put(held);
 		xfs_wicache_entry_put(entry);
 		cond_resched();
 		goto retry;
@@ -1078,7 +1116,7 @@ retry_entry:
 			if (empty)
 				xfs_wicache_remove_entry(entry);
 			if (owned_file)
-				fput(owned_file);
+				xfs_wicache_owner_file_put(owned_file);
 		}
 		xfs_wicache_entry_put(entry);
 		if (error)
@@ -1317,7 +1355,7 @@ xfs_wicache_prepare_entry(
 	entry->active_mask = 0;
 	entry->state = XFS_WICACHE_ENTRY_FLUSHING;
 	flush_mask = entry->flushing_mask;
-	file = get_file(entry->io_file);
+	file = xfs_wicache_temp_file_get(entry->io_file);
 	if (entry->transient_base) {
 		base = entry->transient_base;
 		folio_get(base);
@@ -1360,7 +1398,7 @@ out:
 	if (base)
 		folio_put(base);
 	if (file)
-		fput(file);
+		xfs_wicache_temp_file_put(file);
 	return ret;
 
 out_unlock:
@@ -1442,7 +1480,7 @@ xfs_wicache_batch_dispatch_work(
 			nr = 1;
 			continue;
 		}
-		file = get_file(entry->io_file);
+		file = xfs_wicache_temp_file_get(entry->io_file);
 		folios[0] = entry->prepared_folio;
 		mutex_unlock(&entry->lock);
 		for (nr = 1; first + nr < batch->nr; nr++) {
@@ -1468,7 +1506,7 @@ xfs_wicache_batch_dispatch_work(
 		xfs_wicache_dio_finish();
 		atomic64_add(ktime_get_ns() - start,
 				&xfs_wicache_global_dio_read_ns);
-		fput(file);
+		xfs_wicache_temp_file_put(file);
 		if (ret != (ssize_t)nr << PAGE_SHIFT)
 			ret = ret < 0 ? ret : -EIO;
 		for (i = 0; i < nr; i++) {
@@ -1498,7 +1536,7 @@ xfs_wicache_batch_dispatch_work(
 			nr = 1;
 			continue;
 		}
-		file = get_file(entry->io_file);
+		file = xfs_wicache_temp_file_get(entry->io_file);
 		folios[0] = entry->prepared_folio;
 		mutex_unlock(&entry->lock);
 		for (nr = 1; first + nr < batch->nr; nr++) {
@@ -1524,7 +1562,7 @@ xfs_wicache_batch_dispatch_work(
 		xfs_wicache_dio_finish();
 		atomic64_add(ktime_get_ns() - start,
 				&xfs_wicache_global_dio_write_ns);
-		fput(file);
+		xfs_wicache_temp_file_put(file);
 		if (ret != (ssize_t)nr << PAGE_SHIFT)
 			ret = ret < 0 ? ret : -EIO;
 		for (i = 0; i < nr; i++) {
@@ -1640,7 +1678,7 @@ xfs_wicache_finish_entry(
 		xfs_wicache_remove_entry(entry);
 
 	if (owned_file)
-		fput(owned_file);
+		xfs_wicache_owner_file_put(owned_file);
 	if (folio) {
 		folio_put(folio);
 		if (folio_charged)
