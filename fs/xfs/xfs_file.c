@@ -1368,6 +1368,7 @@ xfs_file_wicache_write(
 	size_t			done = 0;
 	ssize_t			ret;
 	bool			has_entry;
+	bool			aligned;
 	bool			written;
 	u64			start;
 
@@ -1375,20 +1376,16 @@ xfs_file_wicache_write(
 		return -EOPNOTSUPP;
 	count = iov_iter_count(from);
 	pos = iocb->ki_pos;
+	aligned = IS_ALIGNED(pos, PAGE_SIZE) &&
+		  IS_ALIGNED(count, PAGE_SIZE);
 	admission = xfs_wicache_admission_lock(wm, ip);
 	mutex_lock(admission);
-	if (!(iocb->ki_flags & IOCB_DIRECT) &&
-	    IS_ALIGNED(pos, PAGE_SIZE) && IS_ALIGNED(count, PAGE_SIZE) &&
-	    !atomic64_read(&wm->total_dirty_bytes)) {
-		wi = NULL;
-		ret = xfs_file_buffered_write(iocb, from);
-		goto out_admission;
-	}
 	wi = xfs_wicache_inode_lookup(wm, ip);
 	has_entry = wi && xfs_wicache_range_has_entry(wi, pos, count);
 	if (!xfs_wicache_can_stage(iocb, from) ||
 	    xfs_has_wsync(ip->i_mount) || IS_SYNC(inode) ||
-	    xfs_is_cow_inode(ip) || pos + count > i_size_read(inode)) {
+	    xfs_is_cow_inode(ip) ||
+	    (!aligned && pos + count > i_size_read(inode))) {
 		if (has_entry) {
 			ret = xfs_wicache_inode_drain(wi);
 			if (ret)
@@ -1401,13 +1398,18 @@ xfs_file_wicache_write(
 		}
 		goto out_admission;
 	}
-	if (IS_ALIGNED(pos, PAGE_SIZE) && IS_ALIGNED(count, PAGE_SIZE)) {
+	/* Keep complete-page writes out of the dirty page cache. */
+	if (aligned) {
 		if (has_entry) {
 			ret = xfs_wicache_inode_drain(wi);
 			if (ret)
 				goto out_admission;
 		}
-		ret = xfs_file_buffered_write(iocb, from);
+		if (fault_in_iov_iter_readable(from, count) == count) {
+			ret = -EFAULT;
+			goto out_admission;
+		}
+		ret = xfs_file_wicache_dio_part(iocb, from, count);
 		goto out_admission;
 	}
 	if (has_entry && offset_in_page(pos) + count > PAGE_SIZE) {
