@@ -1029,22 +1029,68 @@ xfs_file_wicache_stage_part(
 }
 
 static ssize_t
-xfs_file_wicache_native_part(
+xfs_file_wicache_dio_chunk(
 	struct kiocb		*iocb,
 	struct iov_iter		*from,
 	size_t			count)
 {
-	struct kiocb		part_iocb = *iocb;
 	struct iov_iter		part = *from;
+	struct folio		**folios;
+	unsigned int		nr = count >> PAGE_SHIFT;
+	unsigned int		i;
 	ssize_t			ret;
 
+	folios = kcalloc(nr, sizeof(*folios), GFP_NOFS);
+	if (!folios)
+		return -ENOMEM;
 	iov_iter_truncate(&part, count);
-	ret = xfs_file_buffered_write(&part_iocb, &part);
+	for (i = 0; i < nr; i++) {
+		folios[i] = folio_alloc(GFP_NOFS, 0);
+		if (!folios[i]) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		if (copy_folio_from_iter_atomic(folios[i], 0, PAGE_SIZE,
+				&part) != PAGE_SIZE) {
+			ret = -EFAULT;
+			goto out;
+		}
+	}
+	ret = xfs_wicache_dio_write_folios(iocb->ki_filp, iocb->ki_pos,
+			folios, nr);
 	if (ret > 0) {
 		iov_iter_advance(from, ret);
 		iocb->ki_pos += ret;
 	}
+
+out:
+	for (i = 0; i < nr; i++)
+		if (folios[i])
+			folio_put(folios[i]);
+	kfree(folios);
 	return ret;
+}
+
+static ssize_t
+xfs_file_wicache_dio_part(
+	struct kiocb		*iocb,
+	struct iov_iter		*from,
+	size_t			count)
+{
+	size_t			done = 0;
+	ssize_t			ret;
+
+	while (done < count) {
+		size_t chunk = min_t(size_t, count - done, 4UL << 20);
+
+		ret = xfs_file_wicache_dio_chunk(iocb, from, chunk);
+		if (ret <= 0)
+			return done ? done : ret;
+		done += ret;
+		if (ret != chunk)
+			break;
+	}
+	return done;
 }
 
 static ssize_t
@@ -1172,7 +1218,7 @@ xfs_file_wicache_write(
 			goto out_partial;
 	}
 	if (middle) {
-		ret = xfs_file_wicache_native_part(iocb, from, middle);
+		ret = xfs_file_wicache_dio_part(iocb, from, middle);
 		if (ret <= 0)
 			goto out_partial;
 		done += ret;
