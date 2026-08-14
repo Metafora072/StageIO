@@ -527,8 +527,6 @@ xfs_wicache_entry_free_rcu(
 		kfree(entry->active_valid[i]);
 		kfree(entry->flushing_valid[i]);
 	}
-	if (entry->transient_base)
-		folio_put(entry->transient_base);
 	if (entry->prepared_folio)
 		folio_put(entry->prepared_folio);
 	if (WARN_ON_ONCE(entry->io_file))
@@ -614,11 +612,6 @@ xfs_wicache_entry_drop_buffers(
 			xfs_wicache_uncharge(wm, XFS_WICACHE_SEG_SIZE +
 					XFS_WICACHE_VALID_SIZE);
 		}
-	}
-	if (entry->transient_base) {
-		folio_put(entry->transient_base);
-		entry->transient_base = NULL;
-		xfs_wicache_uncharge(wm, PAGE_SIZE);
 	}
 	if (entry->prepared_folio) {
 		folio_put(entry->prepared_folio);
@@ -1568,19 +1561,6 @@ xfs_wicache_copy_cache_base(
 }
 
 static void
-xfs_wicache_copy_folio(
-	struct folio		*dst,
-	struct folio		*src)
-{
-	void			*src_addr = kmap_local_folio(src, 0);
-	void			*dst_addr = kmap_local_folio(dst, 0);
-
-	memcpy(dst_addr, src_addr, PAGE_SIZE);
-	kunmap_local(dst_addr);
-	kunmap_local(src_addr);
-}
-
-static void
 xfs_wicache_apply_flushing(
 	struct xfs_wicache_entry *entry,
 	struct folio		*folio)
@@ -1664,7 +1644,7 @@ xfs_wicache_prepare_entry(
 	struct xfs_wicache_entry *entry)
 {
 	struct xfs_wicache_mount *wm = entry->wi->wm;
-	struct folio		*folio = NULL, *base = NULL;
+	struct folio		*folio = NULL;
 	struct file		*file = NULL;
 	ssize_t			ret = 0;
 	bool			charged = false, full;
@@ -1688,10 +1668,6 @@ xfs_wicache_prepare_entry(
 	entry->state = XFS_WICACHE_ENTRY_FLUSHING;
 	full = xfs_wicache_flushing_full(entry);
 	file = xfs_wicache_temp_file_get(entry->io_file);
-	if (entry->transient_base) {
-		base = entry->transient_base;
-		folio_get(base);
-	}
 	mutex_unlock(&entry->lock);
 
 	ret = xfs_wicache_charge(wm, PAGE_SIZE, false);
@@ -1709,9 +1685,6 @@ xfs_wicache_prepare_entry(
 	if (full) {
 		folio_zero_range(folio, 0, PAGE_SIZE);
 		atomic64_inc(&xfs_wicache_global_full_cancels);
-	} else if (base) {
-		xfs_wicache_copy_folio(folio, base);
-		atomic64_inc(&xfs_wicache_global_cache_bases);
 	} else if (xfs_wicache_copy_cache_base(file, entry->page_index,
 			folio)) {
 		atomic64_inc(&xfs_wicache_global_cache_bases);
@@ -1727,8 +1700,6 @@ out:
 	entry->prepared_charged = charged;
 	entry->prepare_error = ret;
 	mutex_unlock(&entry->lock);
-	if (base)
-		folio_put(base);
 	if (file)
 		xfs_wicache_temp_file_put(file);
 	return ret;
@@ -1968,17 +1939,7 @@ xfs_wicache_finish_entry(
 		entry->flushing_mask = 0;
 		atomic64_add(flush_bytes, &xfs_wicache_global_drained_bytes);
 
-		if (entry->transient_base) {
-			folio_put(entry->transient_base);
-			entry->transient_base = NULL;
-			xfs_wicache_uncharge(wm, PAGE_SIZE);
-		}
 		if (entry->active_mask) {
-			if (folio_charged) {
-				entry->transient_base = folio;
-				folio = NULL;
-				folio_charged = false;
-			}
 			entry->state = XFS_WICACHE_ENTRY_DIRTY;
 			requeue = true;
 		} else {

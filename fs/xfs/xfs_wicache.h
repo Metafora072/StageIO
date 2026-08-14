@@ -65,7 +65,6 @@ struct xfs_wicache_entry {
 	unsigned long			*flushing_valid[XFS_WICACHE_NR_SEGS];
 	unsigned long			active_mask;
 	unsigned long			flushing_mask;
-	struct folio			*transient_base;
 	struct folio			*prepared_folio;
 	bool				prepared_charged;
 	struct xfs_wicache_batch	*batch;
