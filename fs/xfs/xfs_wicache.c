@@ -1015,6 +1015,7 @@ xfs_wicache_stage_segment(
 {
 	struct xfs_wicache_mount *wm = entry->wi->wm;
 	u8			*new_data = NULL;
+	struct iov_iter		iter;
 	size_t			copied;
 	int			error;
 
@@ -1024,11 +1025,13 @@ xfs_wicache_stage_segment(
 		return -EAGAIN;
 	}
 	if (entry->active[seg]) {
+		iter = *from;
 		copied = copy_from_iter(entry->active[seg],
-				XFS_WICACHE_SEG_SIZE, from);
+				XFS_WICACHE_SEG_SIZE, &iter);
 		if (copied == XFS_WICACHE_SEG_SIZE) {
 			entry->active_mask |= BIT(seg);
 			entry->seq = atomic64_inc_return(&entry->wi->seq);
+			iov_iter_advance(from, XFS_WICACHE_SEG_SIZE);
 		}
 		mutex_unlock(&entry->lock);
 		return copied == XFS_WICACHE_SEG_SIZE ? 0 : -EFAULT;
@@ -1044,7 +1047,8 @@ xfs_wicache_stage_segment(
 		xfs_wicache_uncharge(wm, XFS_WICACHE_SEG_SIZE);
 		return -ENOMEM;
 	}
-	copied = copy_from_iter(new_data, XFS_WICACHE_SEG_SIZE, from);
+	iter = *from;
+	copied = copy_from_iter(new_data, XFS_WICACHE_SEG_SIZE, &iter);
 	if (copied != XFS_WICACHE_SEG_SIZE) {
 		kfree(new_data);
 		xfs_wicache_uncharge(wm, XFS_WICACHE_SEG_SIZE);
@@ -1067,6 +1071,7 @@ xfs_wicache_stage_segment(
 	}
 	entry->active_mask |= BIT(seg);
 	entry->seq = atomic64_inc_return(&entry->wi->seq);
+	iov_iter_advance(from, XFS_WICACHE_SEG_SIZE);
 	mutex_unlock(&entry->lock);
 	return 0;
 }
