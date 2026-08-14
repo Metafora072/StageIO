@@ -801,8 +801,8 @@ xfs_wicache_dio_pool_free(
 		return;
 
 	bytes = XFS_WICACHE_DIO_SLOTS *
-		(XFS_WICACHE_DIO_CHUNK +
-		 XFS_WICACHE_DIO_PAGES * sizeof(struct bio_vec) +
+		(XFS_WICACHE_DIO_SLOT_SIZE +
+		 XFS_WICACHE_DIO_SLOT_PAGES * sizeof(struct bio_vec) +
 		 sizeof(struct xfs_wicache_dio_slot));
 	for (i = 0; i < XFS_WICACHE_DIO_SLOTS; i++) {
 		vfree(wm->dio_slots[i].data);
@@ -832,14 +832,14 @@ xfs_wicache_dio_pool_init(
 
 	for (i = 0; i < XFS_WICACHE_DIO_SLOTS; i++) {
 		slot = &wm->dio_slots[i];
-		slot->data = __vmalloc(XFS_WICACHE_DIO_CHUNK,
+		slot->data = __vmalloc(XFS_WICACHE_DIO_SLOT_SIZE,
 				XFS_WICACHE_ACCOUNT_GFP(gfp) | __GFP_ZERO);
-		slot->bvec = kcalloc(XFS_WICACHE_DIO_PAGES,
+		slot->bvec = kcalloc(XFS_WICACHE_DIO_SLOT_PAGES,
 				sizeof(*slot->bvec),
 				XFS_WICACHE_ACCOUNT_GFP(gfp));
 		if (!slot->data || !slot->bvec)
 			goto out_free;
-		for (j = 0; j < XFS_WICACHE_DIO_PAGES; j++) {
+		for (j = 0; j < XFS_WICACHE_DIO_SLOT_PAGES; j++) {
 			slot->bvec[j].bv_page = vmalloc_to_page(
 					(char *)slot->data + (j << PAGE_SHIFT));
 			slot->bvec[j].bv_len = PAGE_SIZE;
@@ -850,8 +850,8 @@ xfs_wicache_dio_pool_init(
 	}
 
 	bytes = XFS_WICACHE_DIO_SLOTS *
-		(XFS_WICACHE_DIO_CHUNK +
-		 XFS_WICACHE_DIO_PAGES * sizeof(struct bio_vec) +
+		(XFS_WICACHE_DIO_SLOT_SIZE +
+		 XFS_WICACHE_DIO_SLOT_PAGES * sizeof(struct bio_vec) +
 		 sizeof(struct xfs_wicache_dio_slot));
 	atomic64_add(bytes, &xfs_wicache_global_dio_pool_bytes);
 	return 0;
