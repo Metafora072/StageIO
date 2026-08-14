@@ -817,14 +817,19 @@ xfs_wicache_dio_folios(
 	loff_t			pos,
 	struct folio		**folios,
 	unsigned int		nr,
-	unsigned int		direction)
+	unsigned int		direction,
+	u64			*bvec_ns,
+	u64			*dio_ns)
 {
 	struct kiocb		kiocb;
 	struct bio_vec		*bvec;
 	struct iov_iter		iter;
 	ssize_t			ret;
 	unsigned int		i;
+	u64			start = 0;
 
+	if (bvec_ns)
+		start = ktime_get_ns();
 	bvec = kcalloc(nr, sizeof(*bvec), GFP_NOFS);
 	if (!bvec)
 		return -ENOMEM;
@@ -836,11 +841,21 @@ xfs_wicache_dio_folios(
 	kiocb.ki_flags |= IOCB_DIRECT;
 	kiocb.ki_pos = pos;
 	iov_iter_bvec(&iter, direction, bvec, nr, (size_t)nr << PAGE_SHIFT);
+	if (bvec_ns)
+		*bvec_ns = ktime_get_ns() - start;
+	if (dio_ns)
+		start = ktime_get_ns();
 	if (direction == ITER_DEST)
 		ret = xfs_file_dio_read(&kiocb, &iter);
 	else
 		ret = xfs_file_dio_write(&kiocb, &iter);
+	if (dio_ns)
+		*dio_ns = ktime_get_ns() - start;
+	if (bvec_ns)
+		start = ktime_get_ns();
 	kfree(bvec);
+	if (bvec_ns)
+		*bvec_ns += ktime_get_ns() - start;
 	return ret;
 }
 
@@ -851,7 +866,8 @@ xfs_wicache_dio_read_folios(
 	struct folio		**folios,
 	unsigned int		nr)
 {
-	return xfs_wicache_dio_folios(file, pos, folios, nr, ITER_DEST);
+	return xfs_wicache_dio_folios(file, pos, folios, nr, ITER_DEST,
+			NULL, NULL);
 }
 
 ssize_t
@@ -861,7 +877,21 @@ xfs_wicache_dio_write_folios(
 	struct folio		**folios,
 	unsigned int		nr)
 {
-	return xfs_wicache_dio_folios(file, pos, folios, nr, ITER_SOURCE);
+	return xfs_wicache_dio_folios(file, pos, folios, nr, ITER_SOURCE,
+			NULL, NULL);
+}
+
+ssize_t
+xfs_wicache_dio_write_folios_timed(
+	struct file		*file,
+	loff_t			pos,
+	struct folio		**folios,
+	unsigned int		nr,
+	u64			*bvec_ns,
+	u64			*dio_ns)
+{
+	return xfs_wicache_dio_folios(file, pos, folios, nr, ITER_SOURCE,
+			bvec_ns, dio_ns);
 }
 #endif
 
@@ -1039,7 +1069,10 @@ xfs_file_wicache_dio_chunk(
 	unsigned int		nr = count >> PAGE_SHIFT;
 	unsigned int		i;
 	ssize_t			ret;
+	u64			prepare_ns = 0, bvec_ns = 0;
+	u64			dio_ns = 0, release_ns, start;
 
+	start = ktime_get_ns();
 	folios = kcalloc(nr, sizeof(*folios), GFP_NOFS);
 	if (!folios)
 		return -ENOMEM;
@@ -1048,26 +1081,33 @@ xfs_file_wicache_dio_chunk(
 		folios[i] = folio_alloc(GFP_NOFS, 0);
 		if (!folios[i]) {
 			ret = -ENOMEM;
+			prepare_ns = ktime_get_ns() - start;
 			goto out;
 		}
 		if (copy_folio_from_iter_atomic(folios[i], 0, PAGE_SIZE,
 				&part) != PAGE_SIZE) {
 			ret = -EFAULT;
+			prepare_ns = ktime_get_ns() - start;
 			goto out;
 		}
 	}
-	ret = xfs_wicache_dio_write_folios(iocb->ki_filp, iocb->ki_pos,
-			folios, nr);
+	prepare_ns = ktime_get_ns() - start;
+	ret = xfs_wicache_dio_write_folios_timed(iocb->ki_filp,
+			iocb->ki_pos, folios, nr, &bvec_ns, &dio_ns);
 	if (ret > 0) {
 		iov_iter_advance(from, ret);
 		iocb->ki_pos += ret;
 	}
 
 out:
+	start = ktime_get_ns();
 	for (i = 0; i < nr; i++)
 		if (folios[i])
 			folio_put(folios[i]);
 	kfree(folios);
+	release_ns = ktime_get_ns() - start;
+	xfs_wicache_record_middle_dio(count, prepare_ns, bvec_ns, dio_ns,
+			release_ns);
 	return ret;
 }
 

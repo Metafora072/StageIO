@@ -69,6 +69,12 @@ static atomic64_t xfs_wicache_global_front_iolock_max_ns;
 static atomic64_t xfs_wicache_global_mapping_check_ns;
 static atomic64_t xfs_wicache_global_owner_file_refs;
 static atomic64_t xfs_wicache_global_temp_file_refs;
+static atomic64_t xfs_wicache_global_middle_calls;
+static atomic64_t xfs_wicache_global_middle_bytes;
+static atomic64_t xfs_wicache_global_middle_prepare_ns;
+static atomic64_t xfs_wicache_global_middle_bvec_ns;
+static atomic64_t xfs_wicache_global_middle_dio_ns;
+static atomic64_t xfs_wicache_global_middle_release_ns;
 
 module_param_named(wicache_enable, xfs_wicache_enable, bool, 0444);
 MODULE_PARM_DESC(wicache_enable, "Enable experimental sparse write overlay");
@@ -178,6 +184,34 @@ module_param_cb(wicache_owner_file_refs, &xfs_wicache_atomic64_ops,
 		&xfs_wicache_global_owner_file_refs, 0444);
 module_param_cb(wicache_temp_file_refs, &xfs_wicache_atomic64_ops,
 		&xfs_wicache_global_temp_file_refs, 0444);
+module_param_cb(wicache_middle_calls, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_middle_calls, 0444);
+module_param_cb(wicache_middle_bytes, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_middle_bytes, 0444);
+module_param_cb(wicache_middle_prepare_ns, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_middle_prepare_ns, 0444);
+module_param_cb(wicache_middle_bvec_ns, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_middle_bvec_ns, 0444);
+module_param_cb(wicache_middle_dio_ns, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_middle_dio_ns, 0444);
+module_param_cb(wicache_middle_release_ns, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_middle_release_ns, 0444);
+
+void
+xfs_wicache_record_middle_dio(
+	size_t			bytes,
+	u64			prepare_ns,
+	u64			bvec_ns,
+	u64			dio_ns,
+	u64			release_ns)
+{
+	atomic64_inc(&xfs_wicache_global_middle_calls);
+	atomic64_add(bytes, &xfs_wicache_global_middle_bytes);
+	atomic64_add(prepare_ns, &xfs_wicache_global_middle_prepare_ns);
+	atomic64_add(bvec_ns, &xfs_wicache_global_middle_bvec_ns);
+	atomic64_add(dio_ns, &xfs_wicache_global_middle_dio_ns);
+	atomic64_add(release_ns, &xfs_wicache_global_middle_release_ns);
+}
 
 static struct file *
 xfs_wicache_owner_file_get(

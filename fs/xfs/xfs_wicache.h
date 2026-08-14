@@ -144,6 +144,8 @@ void xfs_wicache_read_unlock(struct xfs_wicache_inode *wi);
 void xfs_wicache_record_front_iolock(u64 ns);
 void xfs_wicache_record_mapping_check(u64 ns);
 unsigned long xfs_wicache_io_unit_bytes(void);
+void xfs_wicache_record_middle_dio(size_t bytes, u64 prepare_ns,
+		u64 bvec_ns, u64 dio_ns, u64 release_ns);
 
 ssize_t xfs_wicache_dio_read_folio(struct file *file, loff_t pos,
 		struct folio *folio);
@@ -153,5 +155,8 @@ ssize_t xfs_wicache_dio_read_folios(struct file *file, loff_t pos,
 		struct folio **folios, unsigned int nr);
 ssize_t xfs_wicache_dio_write_folios(struct file *file, loff_t pos,
 		struct folio **folios, unsigned int nr);
+ssize_t xfs_wicache_dio_write_folios_timed(struct file *file, loff_t pos,
+		struct folio **folios, unsigned int nr, u64 *bvec_ns,
+		u64 *dio_ns);
 
 #endif /* __XFS_WICACHE_H__ */
