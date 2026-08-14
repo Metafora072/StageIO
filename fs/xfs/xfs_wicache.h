@@ -11,7 +11,6 @@
 #include <linux/mutex.h>
 #include <linux/rcupdate.h>
 #include <linux/refcount.h>
-#include <linux/rhashtable.h>
 #include <linux/rbtree.h>
 #include <linux/rwsem.h>
 #include <linux/spinlock.h>
@@ -92,7 +91,6 @@ struct xfs_wicache_shard {
 struct xfs_wicache_inode {
 	struct xfs_wicache_mount	*wm;
 	struct xfs_inode		*ip;
-	struct rhash_head		hash_node;
 	struct list_head		mount_node;
 
 	struct xfs_wicache_shard	shards[XFS_WICACHE_NR_SHARDS];
@@ -118,7 +116,6 @@ struct xfs_wicache_dio_slot {
 
 struct xfs_wicache_mount {
 	bool				enabled;
-	struct rhashtable		inode_table;
 	struct mutex			inode_lock;
 	struct mutex			admission_locks[XFS_WICACHE_NR_ADMISSION_LOCKS];
 	struct list_head		inodes;
@@ -141,6 +138,7 @@ struct xfs_wicache_inode *xfs_wicache_inode_lookup(
 struct xfs_wicache_inode *xfs_wicache_inode_get_or_create(
 		struct xfs_wicache_mount *wm, struct xfs_inode *ip, gfp_t gfp);
 void xfs_wicache_inode_put(struct xfs_wicache_inode *wi);
+void xfs_wicache_inode_detach(struct xfs_inode *ip);
 struct mutex *xfs_wicache_admission_lock(struct xfs_wicache_mount *wm,
 		struct xfs_inode *ip);
 

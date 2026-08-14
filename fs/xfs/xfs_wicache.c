@@ -93,6 +93,8 @@ static atomic64_t xfs_wicache_global_fragment_ns;
 static atomic64_t xfs_wicache_global_dio_pool_bytes;
 static atomic64_t xfs_wicache_global_dio_pool_wait_calls;
 static atomic64_t xfs_wicache_global_dio_pool_wait_ns;
+static atomic64_t xfs_wicache_global_inode_records;
+static atomic64_t xfs_wicache_global_inode_records_peak;
 
 module_param_named(wicache_enable, xfs_wicache_enable, bool, 0444);
 MODULE_PARM_DESC(wicache_enable, "Enable experimental sparse write overlay");
@@ -252,6 +254,10 @@ module_param_cb(wicache_dio_pool_wait_calls, &xfs_wicache_atomic64_ops,
 		&xfs_wicache_global_dio_pool_wait_calls, 0444);
 module_param_cb(wicache_dio_pool_wait_ns, &xfs_wicache_atomic64_ops,
 		&xfs_wicache_global_dio_pool_wait_ns, 0444);
+module_param_cb(wicache_inode_records, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_inode_records, 0444);
+module_param_cb(wicache_inode_records_peak, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_inode_records_peak, 0444);
 
 void
 xfs_wicache_record_middle_dio(
@@ -340,13 +346,6 @@ xfs_wicache_temp_file_put(
 	atomic64_dec(&xfs_wicache_global_temp_file_refs);
 	fput(file);
 }
-
-static const struct rhashtable_params xfs_wicache_inode_hash_params = {
-	.key_len		= sizeof(struct xfs_inode *),
-	.key_offset		= offsetof(struct xfs_wicache_inode, ip),
-	.head_offset		= offsetof(struct xfs_wicache_inode, hash_node),
-	.automatic_shrinking	= true,
-};
 
 struct xfs_wicache_batch {
 	struct work_struct		dispatch_work;
@@ -730,6 +729,22 @@ xfs_wicache_inode_alloc(
 	INIT_DELAYED_WORK(&wi->flush_work, xfs_wicache_inode_flush_work);
 	INIT_LIST_HEAD(&wi->mount_node);
 	refcount_set(&wi->refcount, 1);
+	{
+		s64 records = atomic64_inc_return(
+				&xfs_wicache_global_inode_records);
+		s64 peak = atomic64_read(
+				&xfs_wicache_global_inode_records_peak);
+
+		while (records > peak) {
+			s64 seen = atomic64_cmpxchg(
+					&xfs_wicache_global_inode_records_peak,
+					peak, records);
+
+			if (seen == peak)
+				break;
+			peak = seen;
+		}
+	}
 	return wi;
 }
 
@@ -751,6 +766,7 @@ xfs_wicache_inode_free_rcu(
 			struct xfs_wicache_inode, rcu);
 
 	xfs_wicache_inode_destroy(wi);
+	atomic64_dec(&xfs_wicache_global_inode_records);
 	xfs_wicache_uncharge(wi->wm, sizeof(*wi));
 	kfree(wi);
 }
@@ -761,14 +777,6 @@ xfs_wicache_inode_put(
 {
 	if (wi && refcount_dec_and_test(&wi->refcount))
 		call_rcu(&wi->rcu, xfs_wicache_inode_free_rcu);
-}
-
-static void
-xfs_wicache_free_inode_record(
-	void			*ptr,
-	void			*arg)
-{
-	xfs_wicache_inode_put(ptr);
 }
 
 static void
@@ -831,6 +839,8 @@ xfs_wicache_reset_stats(void)
 	atomic64_set(&xfs_wicache_global_fragment_ns, 0);
 	atomic64_set(&xfs_wicache_global_dio_pool_wait_calls, 0);
 	atomic64_set(&xfs_wicache_global_dio_pool_wait_ns, 0);
+	atomic64_set(&xfs_wicache_global_inode_records, 0);
+	atomic64_set(&xfs_wicache_global_inode_records_peak, 0);
 }
 
 static void
@@ -976,10 +986,6 @@ xfs_wicache_mount_alloc(
 	INIT_LIST_HEAD(&wm->inodes);
 	init_waitqueue_head(&wm->dirty_wait);
 	atomic64_set(&wm->total_dirty_bytes, 0);
-	error = rhashtable_init(&wm->inode_table,
-			&xfs_wicache_inode_hash_params);
-	if (error)
-		goto out_free;
 
 	wm->enabled = xfs_wicache_enable;
 	if (!wm->enabled)
@@ -994,7 +1000,7 @@ xfs_wicache_mount_alloc(
 			WQ_MEM_RECLAIM);
 	if (!wm->control_wq) {
 		error = -ENOMEM;
-		goto out_hash;
+		goto out_free;
 	}
 	wm->io_wq = alloc_workqueue("xfs-mbuffer-io",
 			WQ_UNBOUND | WQ_MEM_RECLAIM, xfs_wicache_qd);
@@ -1013,8 +1019,6 @@ out_io:
 	destroy_workqueue(wm->io_wq);
 out_control:
 	destroy_workqueue(wm->control_wq);
-out_hash:
-	rhashtable_destroy(&wm->inode_table);
 out_free:
 	kfree(wm);
 	return ERR_PTR(error);
@@ -1099,11 +1103,12 @@ xfs_wicache_mount_free(
 	while (!list_empty(&wm->inodes)) {
 		wi = list_first_entry(&wm->inodes,
 				struct xfs_wicache_inode, mount_node);
+		WRITE_ONCE(wi->state, XFS_WICACHE_INODE_DYING);
+		RCU_INIT_POINTER(wi->ip->i_wicache, NULL);
 		list_del_init(&wi->mount_node);
+		xfs_wicache_inode_put(wi);
 	}
 	mutex_unlock(&wm->inode_lock);
-	rhashtable_free_and_destroy(&wm->inode_table,
-			xfs_wicache_free_inode_record, NULL);
 	rcu_barrier();
 	kfree(wm);
 }
@@ -1119,8 +1124,7 @@ xfs_wicache_inode_lookup(
 		return NULL;
 
 	rcu_read_lock();
-	wi = rhashtable_lookup_fast(&wm->inode_table, &ip,
-			xfs_wicache_inode_hash_params);
+	wi = rcu_dereference(ip->i_wicache);
 	if (wi && !refcount_inc_not_zero(&wi->refcount)) {
 		wi = NULL;
 	} else if (wi && READ_ONCE(wi->state) !=
@@ -1151,14 +1155,9 @@ xfs_wicache_inode_get_or_create(
 	if (!wi)
 		return ERR_PTR(-ENOMEM);
 
-	refcount_inc(&wi->refcount);
-	old = rhashtable_lookup_get_insert_fast(&wm->inode_table,
-			&wi->hash_node, xfs_wicache_inode_hash_params);
-	if (IS_ERR(old)) {
-		xfs_wicache_inode_put(wi);
-		xfs_wicache_inode_put(wi);
-		return ERR_CAST(old);
-	}
+	mutex_lock(&wm->inode_lock);
+	old = rcu_dereference_protected(ip->i_wicache,
+			lockdep_is_held(&wm->inode_lock));
 	if (old) {
 		if (!refcount_inc_not_zero(&old->refcount)) {
 			old = ERR_PTR(-ENOENT);
@@ -1167,15 +1166,47 @@ xfs_wicache_inode_get_or_create(
 			xfs_wicache_inode_put(old);
 			old = ERR_PTR(-ENOENT);
 		}
-		xfs_wicache_inode_put(wi);
+		mutex_unlock(&wm->inode_lock);
 		xfs_wicache_inode_put(wi);
 		return old;
 	}
 
-	mutex_lock(&wm->inode_lock);
+	refcount_inc(&wi->refcount);
+	rcu_assign_pointer(ip->i_wicache, wi);
 	list_add_tail(&wi->mount_node, &wm->inodes);
 	mutex_unlock(&wm->inode_lock);
 	return wi;
+}
+
+void
+xfs_wicache_inode_detach(
+	struct xfs_inode	*ip)
+{
+	struct xfs_wicache_mount *wm;
+	struct xfs_wicache_inode *wi;
+
+	if (!ip || !ip->i_mount)
+		return;
+	wm = ip->i_mount->m_wicache;
+	if (!wm)
+		return;
+
+	mutex_lock(&wm->inode_lock);
+	wi = rcu_dereference_protected(ip->i_wicache,
+			lockdep_is_held(&wm->inode_lock));
+	if (!wi) {
+		mutex_unlock(&wm->inode_lock);
+		return;
+	}
+	WARN_ON_ONCE(atomic64_read(&wi->nr_entries));
+	WRITE_ONCE(wi->state, XFS_WICACHE_INODE_DYING);
+	RCU_INIT_POINTER(ip->i_wicache, NULL);
+	list_del_init(&wi->mount_node);
+	mutex_unlock(&wm->inode_lock);
+
+	cancel_delayed_work_sync(&wi->flush_work);
+	WARN_ON_ONCE(atomic_read(&wi->batch_active));
+	xfs_wicache_inode_put(wi);
 }
 
 static struct xfs_wicache_entry *

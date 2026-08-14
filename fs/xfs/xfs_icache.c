@@ -24,6 +24,7 @@
 #include "xfs_ialloc.h"
 #include "xfs_ag.h"
 #include "xfs_log_priv.h"
+#include "xfs_wicache.h"
 
 #include <linux/iversion.h>
 
@@ -97,6 +98,7 @@ xfs_inode_alloc(
 	/* initialise the xfs inode */
 	ip->i_ino = ino;
 	ip->i_mount = mp;
+	RCU_INIT_POINTER(ip->i_wicache, NULL);
 	memset(&ip->i_imap, 0, sizeof(struct xfs_imap));
 	ip->i_cowfp = NULL;
 	memset(&ip->i_af, 0, sizeof(ip->i_af));
@@ -166,6 +168,7 @@ xfs_inode_free(
 	struct xfs_inode	*ip)
 {
 	ASSERT(!xfs_iflags_test(ip, XFS_IFLUSHING));
+	xfs_wicache_inode_detach(ip);
 
 	/*
 	 * Because we use RCU freeing we need to ensure the inode always
