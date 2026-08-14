@@ -143,6 +143,7 @@ void xfs_wicache_read_lock(struct xfs_wicache_inode *wi);
 void xfs_wicache_read_unlock(struct xfs_wicache_inode *wi);
 void xfs_wicache_record_front_iolock(u64 ns);
 void xfs_wicache_record_mapping_check(u64 ns);
+unsigned long xfs_wicache_io_unit_bytes(void);
 
 ssize_t xfs_wicache_dio_read_folio(struct file *file, loff_t pos,
 		struct folio *folio);

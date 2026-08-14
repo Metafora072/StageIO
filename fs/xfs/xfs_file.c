@@ -1106,6 +1106,7 @@ xfs_file_wicache_write(
 	unsigned int		iolock = XFS_IOLOCK_SHARED;
 	loff_t			pos;
 	size_t			count, head, middle, tail;
+	unsigned long		io_unit;
 	size_t			done = 0;
 	ssize_t			ret;
 	bool			has_entry;
@@ -1204,9 +1205,10 @@ xfs_file_wicache_write(
 	xfs_iunlock(ip, iolock);
 	iolock = 0;
 
-	head = offset_in_page(pos) ?
-		min_t(size_t, count, PAGE_SIZE - offset_in_page(pos)) : 0;
-	middle = round_down(count - head, PAGE_SIZE);
+	io_unit = xfs_wicache_io_unit_bytes();
+	head = (pos & (io_unit - 1)) ?
+		min_t(size_t, count, io_unit - (pos & (io_unit - 1))) : 0;
+	middle = round_down(count - head, io_unit);
 	tail = count - head - middle;
 
 	if (head) {

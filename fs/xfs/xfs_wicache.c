@@ -27,6 +27,7 @@ static unsigned int xfs_wicache_batch = 32;
 static unsigned int xfs_wicache_qd = 16;
 static unsigned int xfs_wicache_delay_ms = 1;
 static unsigned long xfs_wicache_high_bytes = 256UL << 20;
+static unsigned long xfs_wicache_io_unit = PAGE_SIZE;
 
 static atomic64_t xfs_wicache_global_mem_bytes;
 static atomic64_t xfs_wicache_global_peak_bytes;
@@ -79,6 +80,17 @@ module_param_named(wicache_delay_ms, xfs_wicache_delay_ms, uint, 0444);
 MODULE_PARM_DESC(wicache_delay_ms, "Dirty accumulation delay in milliseconds");
 module_param_named(wicache_high_bytes, xfs_wicache_high_bytes, ulong, 0444);
 MODULE_PARM_DESC(wicache_high_bytes, "Sparse overlay payload high watermark");
+module_param_named(wicache_io_unit, xfs_wicache_io_unit, ulong, 0444);
+MODULE_PARM_DESC(wicache_io_unit, "Buffered fragment and direct I/O split unit");
+
+unsigned long
+xfs_wicache_io_unit_bytes(void)
+{
+	if (xfs_wicache_io_unit < PAGE_SIZE ||
+	    !is_power_of_2(xfs_wicache_io_unit))
+		return PAGE_SIZE;
+	return xfs_wicache_io_unit;
+}
 
 static int
 xfs_wicache_atomic64_get(
