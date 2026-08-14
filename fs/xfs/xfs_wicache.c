@@ -398,6 +398,8 @@ xfs_wicache_entry_free_rcu(
 	for (i = 0; i < XFS_WICACHE_NR_SEGS; i++) {
 		kfree(entry->active[i]);
 		kfree(entry->flushing[i]);
+		kfree(entry->active_valid[i]);
+		kfree(entry->flushing_valid[i]);
 	}
 	if (entry->transient_base)
 		folio_put(entry->transient_base);
@@ -480,13 +482,19 @@ xfs_wicache_entry_drop_buffers(
 	for (i = 0; i < XFS_WICACHE_NR_SEGS; i++) {
 		if (entry->active[i]) {
 			kfree(entry->active[i]);
+			kfree(entry->active_valid[i]);
 			entry->active[i] = NULL;
-			xfs_wicache_uncharge(wm, XFS_WICACHE_SEG_SIZE);
+			entry->active_valid[i] = NULL;
+			xfs_wicache_uncharge(wm, XFS_WICACHE_SEG_SIZE +
+					XFS_WICACHE_VALID_SIZE);
 		}
 		if (entry->flushing[i]) {
 			kfree(entry->flushing[i]);
+			kfree(entry->flushing_valid[i]);
 			entry->flushing[i] = NULL;
-			xfs_wicache_uncharge(wm, XFS_WICACHE_SEG_SIZE);
+			entry->flushing_valid[i] = NULL;
+			xfs_wicache_uncharge(wm, XFS_WICACHE_SEG_SIZE +
+					XFS_WICACHE_VALID_SIZE);
 		}
 	}
 	if (entry->transient_base) {
@@ -997,9 +1005,7 @@ xfs_wicache_can_stage(
 	if (!iocb || !from)
 		return false;
 	count = iov_iter_count(from);
-	if (!count || !IS_ALIGNED(iocb->ki_pos, XFS_WICACHE_SEG_SIZE) ||
-	    !IS_ALIGNED(count, XFS_WICACHE_SEG_SIZE) ||
-	    count > PAGE_SIZE - offset_in_page(iocb->ki_pos))
+	if (!count)
 		return false;
 	if (iocb->ki_flags & (IOCB_DIRECT | IOCB_DSYNC | IOCB_SYNC |
 			IOCB_APPEND | IOCB_NOWAIT))
@@ -1008,13 +1014,16 @@ xfs_wicache_can_stage(
 }
 
 static int
-xfs_wicache_stage_segment(
+xfs_wicache_stage_chunk(
 	struct xfs_wicache_entry *entry,
 	unsigned int		seg,
+	unsigned int		offset,
+	size_t			bytes,
 	struct iov_iter		*from)
 {
 	struct xfs_wicache_mount *wm = entry->wi->wm;
 	u8			*new_data = NULL;
+	unsigned long		*new_valid = NULL;
 	struct iov_iter		iter;
 	size_t			copied;
 	int			error;
@@ -1024,54 +1033,70 @@ xfs_wicache_stage_segment(
 		mutex_unlock(&entry->lock);
 		return -EAGAIN;
 	}
-	if (entry->active[seg]) {
+	if (entry->active[seg] && entry->active_valid[seg]) {
 		iter = *from;
-		copied = copy_from_iter(entry->active[seg],
-				XFS_WICACHE_SEG_SIZE, &iter);
-		if (copied == XFS_WICACHE_SEG_SIZE) {
+		copied = copy_from_iter(entry->active[seg] + offset,
+				bytes, &iter);
+		if (copied == bytes) {
+			bitmap_set(entry->active_valid[seg], offset, bytes);
 			entry->active_mask |= BIT(seg);
 			entry->seq = atomic64_inc_return(&entry->wi->seq);
-			iov_iter_advance(from, XFS_WICACHE_SEG_SIZE);
+			iov_iter_advance(from, bytes);
 		}
 		mutex_unlock(&entry->lock);
-		return copied == XFS_WICACHE_SEG_SIZE ? 0 : -EFAULT;
+		return copied == bytes ? 0 : -EFAULT;
 	}
 	mutex_unlock(&entry->lock);
 
-	error = xfs_wicache_charge(wm, XFS_WICACHE_SEG_SIZE, true);
+	error = xfs_wicache_charge(wm, XFS_WICACHE_SEG_SIZE +
+			XFS_WICACHE_VALID_SIZE, true);
 	if (error)
 		return error;
 	new_data = kmalloc(XFS_WICACHE_SEG_SIZE,
 			XFS_WICACHE_ACCOUNT_GFP(GFP_NOFS));
-	if (!new_data) {
-		xfs_wicache_uncharge(wm, XFS_WICACHE_SEG_SIZE);
+	new_valid = bitmap_zalloc(XFS_WICACHE_SEG_SIZE,
+			XFS_WICACHE_ACCOUNT_GFP(GFP_NOFS));
+	if (!new_data || !new_valid) {
+		kfree(new_data);
+		bitmap_free(new_valid);
+		xfs_wicache_uncharge(wm, XFS_WICACHE_SEG_SIZE +
+				XFS_WICACHE_VALID_SIZE);
 		return -ENOMEM;
 	}
 	iter = *from;
-	copied = copy_from_iter(new_data, XFS_WICACHE_SEG_SIZE, &iter);
-	if (copied != XFS_WICACHE_SEG_SIZE) {
+	copied = copy_from_iter(new_data + offset, bytes, &iter);
+	if (copied != bytes) {
 		kfree(new_data);
-		xfs_wicache_uncharge(wm, XFS_WICACHE_SEG_SIZE);
+		bitmap_free(new_valid);
+		xfs_wicache_uncharge(wm, XFS_WICACHE_SEG_SIZE +
+				XFS_WICACHE_VALID_SIZE);
 		return -EFAULT;
 	}
+	bitmap_set(new_valid, offset, bytes);
 
 	mutex_lock(&entry->lock);
 	if (entry->state == XFS_WICACHE_ENTRY_INVALID) {
 		mutex_unlock(&entry->lock);
 		kfree(new_data);
-		xfs_wicache_uncharge(wm, XFS_WICACHE_SEG_SIZE);
+		bitmap_free(new_valid);
+		xfs_wicache_uncharge(wm, XFS_WICACHE_SEG_SIZE +
+				XFS_WICACHE_VALID_SIZE);
 		return -EAGAIN;
 	}
-	if (entry->active[seg]) {
-		memcpy(entry->active[seg], new_data, XFS_WICACHE_SEG_SIZE);
+	if (entry->active[seg] && entry->active_valid[seg]) {
+		memcpy(entry->active[seg] + offset, new_data + offset, bytes);
+		bitmap_set(entry->active_valid[seg], offset, bytes);
 		kfree(new_data);
-		xfs_wicache_uncharge(wm, XFS_WICACHE_SEG_SIZE);
+		bitmap_free(new_valid);
+		xfs_wicache_uncharge(wm, XFS_WICACHE_SEG_SIZE +
+				XFS_WICACHE_VALID_SIZE);
 	} else {
 		entry->active[seg] = new_data;
+		entry->active_valid[seg] = new_valid;
 	}
 	entry->active_mask |= BIT(seg);
 	entry->seq = atomic64_inc_return(&entry->wi->seq);
-	iov_iter_advance(from, XFS_WICACHE_SEG_SIZE);
+	iov_iter_advance(from, bytes);
 	mutex_unlock(&entry->lock);
 	return 0;
 }
@@ -1091,6 +1116,10 @@ xfs_wicache_stage_iter(
 		pgoff_t index = (pos + written) >> PAGE_SHIFT;
 		unsigned int seg = offset_in_page(pos + written) >>
 				XFS_WICACHE_SEG_SHIFT;
+		unsigned int chunk_offset = offset_in_page(pos + written) &
+				(XFS_WICACHE_SEG_SIZE - 1);
+		size_t bytes = min_t(size_t, count - written,
+				XFS_WICACHE_SEG_SIZE - chunk_offset);
 		struct xfs_wicache_entry *entry;
 
 retry_entry:
@@ -1099,7 +1128,8 @@ retry_entry:
 			error = PTR_ERR(entry);
 			break;
 		}
-		error = xfs_wicache_stage_segment(entry, seg, from);
+		error = xfs_wicache_stage_chunk(entry, seg, chunk_offset,
+				bytes, from);
 		if (error == -EAGAIN) {
 			xfs_wicache_entry_put(entry);
 			cond_resched();
@@ -1127,7 +1157,7 @@ retry_entry:
 		xfs_wicache_entry_put(entry);
 		if (error)
 			break;
-		written += XFS_WICACHE_SEG_SIZE;
+		written += bytes;
 	}
 
 	atomic64_add(written, &xfs_wicache_global_accepted_bytes);
@@ -1139,6 +1169,7 @@ static int
 xfs_wicache_overlay_data(
 	struct xfs_wicache_entry *entry,
 	u8			**segments,
+	unsigned long		**valid,
 	unsigned long		mask,
 	struct iov_iter		*to,
 	loff_t			pos,
@@ -1153,17 +1184,25 @@ xfs_wicache_overlay_data(
 		loff_t copy_start = max_t(loff_t, pos, seg_start);
 		loff_t copy_end = min_t(loff_t, end,
 				seg_start + XFS_WICACHE_SEG_SIZE);
-		struct iov_iter dst;
-		size_t bytes;
+		unsigned int first, last, bit;
 
-		if (copy_start >= copy_end || !segments[i])
+		if (copy_start >= copy_end || !segments[i] || !valid[i])
 			continue;
-		dst = *to;
-		iov_iter_advance(&dst, copy_start - pos);
-		bytes = copy_end - copy_start;
-		if (copy_to_iter(segments[i] + copy_start - seg_start,
-				bytes, &dst) != bytes)
-			return -EFAULT;
+		first = copy_start - seg_start;
+		last = copy_end - seg_start;
+		bit = find_next_bit(valid[i], last, first);
+		while (bit < last) {
+			struct iov_iter dst = *to;
+			unsigned int run_end = find_next_zero_bit(valid[i],
+					last, bit);
+			size_t bytes = run_end - bit;
+
+			iov_iter_advance(&dst, seg_start + bit - pos);
+			if (copy_to_iter(segments[i] + bit, bytes, &dst) !=
+			    bytes)
+				return -EFAULT;
+			bit = find_next_bit(valid[i], last, run_end);
+		}
 	}
 	return 0;
 }
@@ -1188,9 +1227,11 @@ xfs_wicache_overlay_iter(
 			continue;
 		mutex_lock(&entry->lock);
 		error = xfs_wicache_overlay_data(entry, entry->flushing,
+				entry->flushing_valid,
 				entry->flushing_mask, to, pos, count);
 		if (!error)
 			error = xfs_wicache_overlay_data(entry, entry->active,
+					entry->active_valid,
 					entry->active_mask, to, pos, count);
 		mutex_unlock(&entry->lock);
 		xfs_wicache_entry_put(entry);
@@ -1304,14 +1345,44 @@ xfs_wicache_apply_flushing(
 	struct folio		*folio)
 {
 	void			*addr = kmap_local_folio(folio, 0);
-	unsigned int		i;
+	unsigned int		i, bit;
 
 	mutex_lock(&entry->lock);
-	for_each_set_bit(i, &entry->flushing_mask, XFS_WICACHE_NR_SEGS)
-		memcpy(addr + (i << XFS_WICACHE_SEG_SHIFT),
-				entry->flushing[i], XFS_WICACHE_SEG_SIZE);
+	for_each_set_bit(i, &entry->flushing_mask, XFS_WICACHE_NR_SEGS) {
+		if (!entry->flushing[i] || !entry->flushing_valid[i])
+			continue;
+		bit = find_first_bit(entry->flushing_valid[i],
+				XFS_WICACHE_SEG_SIZE);
+		while (bit < XFS_WICACHE_SEG_SIZE) {
+			unsigned int run_end = find_next_zero_bit(
+					entry->flushing_valid[i],
+					XFS_WICACHE_SEG_SIZE, bit);
+
+			memcpy(addr + (i << XFS_WICACHE_SEG_SHIFT) + bit,
+					entry->flushing[i] + bit, run_end - bit);
+			bit = find_next_bit(entry->flushing_valid[i],
+					XFS_WICACHE_SEG_SIZE, run_end);
+		}
+	}
 	mutex_unlock(&entry->lock);
 	kunmap_local(addr);
+}
+
+static bool
+xfs_wicache_flushing_full(
+	struct xfs_wicache_entry *entry)
+{
+	unsigned int		i;
+
+	if (entry->flushing_mask != XFS_WICACHE_FULL_MASK)
+		return false;
+	for (i = 0; i < XFS_WICACHE_NR_SEGS; i++) {
+		if (!entry->flushing_valid[i] ||
+		    !bitmap_full(entry->flushing_valid[i],
+			    XFS_WICACHE_SEG_SIZE))
+			return false;
+	}
+	return true;
 }
 
 static void
@@ -1352,9 +1423,8 @@ xfs_wicache_prepare_entry(
 	struct xfs_wicache_mount *wm = entry->wi->wm;
 	struct folio		*folio = NULL, *base = NULL;
 	struct file		*file = NULL;
-	unsigned long		flush_mask;
 	ssize_t			ret = 0;
-	bool			charged = false;
+	bool			charged = false, full;
 	unsigned int		i;
 
 	mutex_lock(&entry->lock);
@@ -1366,12 +1436,14 @@ xfs_wicache_prepare_entry(
 	}
 	for (i = 0; i < XFS_WICACHE_NR_SEGS; i++) {
 		entry->flushing[i] = entry->active[i];
+		entry->flushing_valid[i] = entry->active_valid[i];
 		entry->active[i] = NULL;
+		entry->active_valid[i] = NULL;
 	}
 	entry->flushing_mask = entry->active_mask;
 	entry->active_mask = 0;
 	entry->state = XFS_WICACHE_ENTRY_FLUSHING;
-	flush_mask = entry->flushing_mask;
+	full = xfs_wicache_flushing_full(entry);
 	file = xfs_wicache_temp_file_get(entry->io_file);
 	if (entry->transient_base) {
 		base = entry->transient_base;
@@ -1391,7 +1463,7 @@ xfs_wicache_prepare_entry(
 		goto out;
 	}
 
-	if (flush_mask == XFS_WICACHE_FULL_MASK) {
+	if (full) {
 		folio_zero_range(folio, 0, PAGE_SIZE);
 		atomic64_inc(&xfs_wicache_global_full_cancels);
 	} else if (base) {
@@ -1616,11 +1688,11 @@ xfs_wicache_finish_entry(
 	struct xfs_wicache_mount *wm = wi->wm;
 	struct folio		*folio;
 	struct file		*owned_file = NULL;
-	unsigned long		flush_mask;
 	ssize_t			ret;
 	bool			folio_charged;
 	bool			remove = false, requeue = false;
-	unsigned int		i;
+	unsigned int		i, bit;
+	u64			flush_bytes = 0;
 
 	mutex_lock(&entry->lock);
 	folio = entry->prepared_folio;
@@ -1629,7 +1701,6 @@ xfs_wicache_finish_entry(
 	entry->prepared_charged = false;
 	ret = entry->prepare_error;
 	entry->prepare_error = 0;
-	flush_mask = entry->flushing_mask;
 	mutex_unlock(&entry->lock);
 
 	if (!ret)
@@ -1640,14 +1711,19 @@ xfs_wicache_finish_entry(
 		for (i = 0; i < XFS_WICACHE_NR_SEGS; i++) {
 			if (!entry->flushing[i])
 				continue;
+			if (entry->flushing_valid[i])
+				flush_bytes += bitmap_weight(
+						entry->flushing_valid[i],
+						XFS_WICACHE_SEG_SIZE);
 			kfree(entry->flushing[i]);
+			bitmap_free(entry->flushing_valid[i]);
 			entry->flushing[i] = NULL;
-			xfs_wicache_uncharge(wm, XFS_WICACHE_SEG_SIZE);
+			entry->flushing_valid[i] = NULL;
+			xfs_wicache_uncharge(wm, XFS_WICACHE_SEG_SIZE +
+					XFS_WICACHE_VALID_SIZE);
 		}
 		entry->flushing_mask = 0;
-		atomic64_add(hweight_long(flush_mask) *
-				XFS_WICACHE_SEG_SIZE,
-				&xfs_wicache_global_drained_bytes);
+		atomic64_add(flush_bytes, &xfs_wicache_global_drained_bytes);
 
 		if (entry->transient_base) {
 			folio_put(entry->transient_base);
@@ -1672,15 +1748,28 @@ xfs_wicache_finish_entry(
 		for (i = 0; i < XFS_WICACHE_NR_SEGS; i++) {
 			if (!entry->flushing[i])
 				continue;
-			if (entry->active[i]) {
+			if (entry->active[i] && entry->active_valid[i]) {
+				for_each_set_bit(bit, entry->flushing_valid[i],
+						XFS_WICACHE_SEG_SIZE) {
+					if (test_bit(bit, entry->active_valid[i]))
+						continue;
+					entry->active[i][bit] =
+						entry->flushing[i][bit];
+					set_bit(bit, entry->active_valid[i]);
+				}
 				kfree(entry->flushing[i]);
+				bitmap_free(entry->flushing_valid[i]);
 				xfs_wicache_uncharge(wm,
-						XFS_WICACHE_SEG_SIZE);
+						XFS_WICACHE_SEG_SIZE +
+						XFS_WICACHE_VALID_SIZE);
 			} else {
 				entry->active[i] = entry->flushing[i];
+				entry->active_valid[i] =
+						entry->flushing_valid[i];
 				entry->active_mask |= BIT(i);
 			}
 			entry->flushing[i] = NULL;
+			entry->flushing_valid[i] = NULL;
 		}
 		entry->flushing_mask = 0;
 		entry->state = XFS_WICACHE_ENTRY_DIRTY;

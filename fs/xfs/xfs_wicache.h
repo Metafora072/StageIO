@@ -5,6 +5,7 @@
 #define USE_WICACHE
 
 #include <linux/atomic.h>
+#include <linux/bitmap.h>
 #include <linux/gfp_types.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
@@ -32,6 +33,8 @@ struct xfs_inode;
 #define XFS_WICACHE_SEG_SHIFT		9
 #define XFS_WICACHE_SEG_SIZE		(1U << XFS_WICACHE_SEG_SHIFT)
 #define XFS_WICACHE_NR_SEGS		(PAGE_SIZE / XFS_WICACHE_SEG_SIZE)
+#define XFS_WICACHE_VALID_LONGS		BITS_TO_LONGS(XFS_WICACHE_SEG_SIZE)
+#define XFS_WICACHE_VALID_SIZE		(XFS_WICACHE_VALID_LONGS * sizeof(unsigned long))
 #define XFS_WICACHE_FULL_MASK		((1UL << XFS_WICACHE_NR_SEGS) - 1)
 #define XFS_WICACHE_ACCOUNT_GFP(gfp)	((gfp) | __GFP_ACCOUNT)
 
@@ -56,6 +59,8 @@ struct xfs_wicache_entry {
 	pgoff_t			page_index;
 	u8				*active[XFS_WICACHE_NR_SEGS];
 	u8				*flushing[XFS_WICACHE_NR_SEGS];
+	unsigned long			*active_valid[XFS_WICACHE_NR_SEGS];
+	unsigned long			*flushing_valid[XFS_WICACHE_NR_SEGS];
 	unsigned long			active_mask;
 	unsigned long			flushing_mask;
 	struct folio			*transient_base;
