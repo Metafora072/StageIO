@@ -11,7 +11,6 @@
 #include <linux/mutex.h>
 #include <linux/rcupdate.h>
 #include <linux/refcount.h>
-#include <linux/rbtree.h>
 #include <linux/rwsem.h>
 #include <linux/spinlock.h>
 #include <linux/types.h>
@@ -26,8 +25,6 @@ struct iov_iter;
 struct kiocb;
 struct xfs_inode;
 
-#define XFS_WICACHE_NR_SHARDS		64
-#define XFS_WICACHE_SHARD_MASK		(XFS_WICACHE_NR_SHARDS - 1)
 #define XFS_WICACHE_NR_ADMISSION_LOCKS	64
 #define XFS_WICACHE_ADMISSION_MASK	(XFS_WICACHE_NR_ADMISSION_LOCKS - 1)
 #define XFS_WICACHE_SEG_SHIFT		9
@@ -40,6 +37,7 @@ struct xfs_inode;
 #define XFS_WICACHE_DIO_CHUNK		(4UL << 20)
 #define XFS_WICACHE_DIO_SLOTS		2
 #define XFS_WICACHE_DIO_PAGES		(XFS_WICACHE_DIO_CHUNK / PAGE_SIZE)
+#define XFS_WICACHE_XA_DIRTY		XA_MARK_0
 
 enum xfs_wicache_entry_state {
 	XFS_WICACHE_ENTRY_DIRTY = 0,
@@ -74,18 +72,12 @@ struct xfs_wicache_entry {
 	u64				seq;
 	enum xfs_wicache_entry_state	state;
 	bool				queued;
-	bool				on_dirty_tree;
 	u64				prepare_queued_ns;
 
 	refcount_t			refcount;
 	struct mutex			lock;
-	struct rb_node			dirty_node;
 	struct work_struct		prepare_work;
 	struct rcu_head			rcu;
-};
-
-struct xfs_wicache_shard {
-	struct xarray		entries;
 };
 
 struct xfs_wicache_inode {
@@ -93,7 +85,7 @@ struct xfs_wicache_inode {
 	struct xfs_inode		*ip;
 	struct list_head		mount_node;
 
-	struct xfs_wicache_shard	shards[XFS_WICACHE_NR_SHARDS];
+	struct xarray			entries;
 	atomic64_t			dirty_bytes;
 	atomic64_t			nr_entries;
 	atomic64_t			seq;
@@ -101,8 +93,6 @@ struct xfs_wicache_inode {
 	enum xfs_wicache_inode_state	state;
 
 	struct rw_semaphore		visibility_sem;
-	spinlock_t			dirty_lock;
-	struct rb_root_cached		dirty_tree;
 	struct delayed_work		flush_work;
 	refcount_t			refcount;
 	struct rcu_head			rcu;
