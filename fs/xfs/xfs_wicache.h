@@ -131,6 +131,7 @@ ssize_t xfs_wicache_stage_iter(struct xfs_wicache_inode *wi,
 int xfs_wicache_overlay_iter(struct xfs_wicache_inode *wi,
 		struct iov_iter *to, loff_t pos, size_t count);
 bool xfs_wicache_inode_has_dirty(struct xfs_wicache_inode *wi);
+int xfs_wicache_inode_drain(struct xfs_wicache_inode *wi);
 bool xfs_wicache_range_has_entry(struct xfs_wicache_inode *wi,
 		loff_t pos, size_t count);
 void xfs_wicache_read_lock(struct xfs_wicache_inode *wi);

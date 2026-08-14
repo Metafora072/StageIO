@@ -1071,8 +1071,11 @@ xfs_file_wicache_write(
 	    xfs_has_wsync(ip->i_mount) || IS_SYNC(inode) ||
 	    xfs_is_cow_inode(ip) || pos + count > i_size_read(inode)) {
 		if (has_entry) {
-			ret = -EAGAIN;
-		} else if (iocb->ki_flags & IOCB_DIRECT) {
+			ret = xfs_wicache_inode_drain(wi);
+			if (ret)
+				goto out_admission;
+		}
+		if (iocb->ki_flags & IOCB_DIRECT) {
 			ret = xfs_file_dio_write(iocb, from);
 		} else {
 			ret = xfs_file_buffered_write(iocb, from);

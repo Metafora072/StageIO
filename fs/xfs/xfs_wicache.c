@@ -998,7 +998,8 @@ xfs_wicache_can_stage(
 		return false;
 	count = iov_iter_count(from);
 	if (!count || !IS_ALIGNED(iocb->ki_pos, XFS_WICACHE_SEG_SIZE) ||
-	    !IS_ALIGNED(count, XFS_WICACHE_SEG_SIZE))
+	    !IS_ALIGNED(count, XFS_WICACHE_SEG_SIZE) ||
+	    count > PAGE_SIZE - offset_in_page(iocb->ki_pos))
 		return false;
 	if (iocb->ki_flags & (IOCB_DIRECT | IOCB_DSYNC | IOCB_SYNC |
 			IOCB_APPEND | IOCB_NOWAIT))
@@ -1199,6 +1200,17 @@ xfs_wicache_inode_has_dirty(
 	struct xfs_wicache_inode *wi)
 {
 	return atomic64_read(&wi->nr_entries) != 0;
+}
+
+int
+xfs_wicache_inode_drain(
+	struct xfs_wicache_inode *wi)
+{
+	if (!xfs_wicache_inode_has_dirty(wi))
+		return 0;
+	mod_delayed_work(wi->wm->control_wq, &wi->flush_work, 0);
+	return wait_event_killable(wi->wm->dirty_wait,
+			!xfs_wicache_inode_has_dirty(wi));
 }
 
 bool
