@@ -11,6 +11,7 @@
 #include "xfs_wicache.h"
 
 #include <linux/err.h>
+#include <linux/bvec.h>
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/highmem.h>
@@ -21,6 +22,7 @@
 #include <linux/pagemap.h>
 #include <linux/slab.h>
 #include <linux/uio.h>
+#include <linux/vmalloc.h>
 
 static bool xfs_wicache_enable;
 static unsigned int xfs_wicache_batch = 32;
@@ -28,6 +30,7 @@ static unsigned int xfs_wicache_qd = 16;
 static unsigned int xfs_wicache_delay_ms = 1;
 static unsigned long xfs_wicache_high_bytes = 256UL << 20;
 static unsigned long xfs_wicache_io_unit = PAGE_SIZE;
+static bool xfs_wicache_user_dio = true;
 
 static atomic64_t xfs_wicache_global_mem_bytes;
 static atomic64_t xfs_wicache_global_peak_bytes;
@@ -75,6 +78,14 @@ static atomic64_t xfs_wicache_global_middle_prepare_ns;
 static atomic64_t xfs_wicache_global_middle_bvec_ns;
 static atomic64_t xfs_wicache_global_middle_dio_ns;
 static atomic64_t xfs_wicache_global_middle_release_ns;
+static atomic64_t xfs_wicache_global_middle_copy_calls;
+static atomic64_t xfs_wicache_global_middle_copy_bytes;
+static atomic64_t xfs_wicache_global_middle_copy_ns;
+static atomic64_t xfs_wicache_global_middle_direct_calls;
+static atomic64_t xfs_wicache_global_middle_direct_bytes;
+static atomic64_t xfs_wicache_global_dio_pool_bytes;
+static atomic64_t xfs_wicache_global_dio_pool_wait_calls;
+static atomic64_t xfs_wicache_global_dio_pool_wait_ns;
 
 module_param_named(wicache_enable, xfs_wicache_enable, bool, 0444);
 MODULE_PARM_DESC(wicache_enable, "Enable experimental sparse write overlay");
@@ -88,6 +99,8 @@ module_param_named(wicache_high_bytes, xfs_wicache_high_bytes, ulong, 0444);
 MODULE_PARM_DESC(wicache_high_bytes, "Sparse overlay payload high watermark");
 module_param_named(wicache_io_unit, xfs_wicache_io_unit, ulong, 0444);
 MODULE_PARM_DESC(wicache_io_unit, "Buffered fragment and direct I/O split unit");
+module_param_named(wicache_user_dio, xfs_wicache_user_dio, bool, 0444);
+MODULE_PARM_DESC(wicache_user_dio, "Use aligned user iterators for middle DIO");
 
 unsigned long
 xfs_wicache_io_unit_bytes(void)
@@ -96,6 +109,12 @@ xfs_wicache_io_unit_bytes(void)
 	    !is_power_of_2(xfs_wicache_io_unit))
 		return PAGE_SIZE;
 	return xfs_wicache_io_unit;
+}
+
+bool
+xfs_wicache_user_dio_enabled(void)
+{
+	return xfs_wicache_user_dio;
 }
 
 static int
@@ -196,6 +215,22 @@ module_param_cb(wicache_middle_dio_ns, &xfs_wicache_atomic64_ops,
 		&xfs_wicache_global_middle_dio_ns, 0444);
 module_param_cb(wicache_middle_release_ns, &xfs_wicache_atomic64_ops,
 		&xfs_wicache_global_middle_release_ns, 0444);
+module_param_cb(wicache_middle_copy_calls, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_middle_copy_calls, 0444);
+module_param_cb(wicache_middle_copy_bytes, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_middle_copy_bytes, 0444);
+module_param_cb(wicache_middle_copy_ns, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_middle_copy_ns, 0444);
+module_param_cb(wicache_middle_direct_calls, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_middle_direct_calls, 0444);
+module_param_cb(wicache_middle_direct_bytes, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_middle_direct_bytes, 0444);
+module_param_cb(wicache_dio_pool_bytes, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_dio_pool_bytes, 0444);
+module_param_cb(wicache_dio_pool_wait_calls, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_dio_pool_wait_calls, 0444);
+module_param_cb(wicache_dio_pool_wait_ns, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_dio_pool_wait_ns, 0444);
 
 void
 xfs_wicache_record_middle_dio(
@@ -211,6 +246,24 @@ xfs_wicache_record_middle_dio(
 	atomic64_add(bvec_ns, &xfs_wicache_global_middle_bvec_ns);
 	atomic64_add(dio_ns, &xfs_wicache_global_middle_dio_ns);
 	atomic64_add(release_ns, &xfs_wicache_global_middle_release_ns);
+}
+
+void
+xfs_wicache_record_middle_copy(
+	size_t			bytes,
+	u64			copy_ns)
+{
+	atomic64_inc(&xfs_wicache_global_middle_copy_calls);
+	atomic64_add(bytes, &xfs_wicache_global_middle_copy_bytes);
+	atomic64_add(copy_ns, &xfs_wicache_global_middle_copy_ns);
+}
+
+void
+xfs_wicache_record_middle_direct(
+	size_t			bytes)
+{
+	atomic64_inc(&xfs_wicache_global_middle_direct_calls);
+	atomic64_add(bytes, &xfs_wicache_global_middle_direct_bytes);
 }
 
 static struct file *
@@ -715,6 +768,144 @@ xfs_wicache_reset_stats(void)
 	atomic64_set(&xfs_wicache_global_front_iolock_calls, 0);
 	atomic64_set(&xfs_wicache_global_front_iolock_max_ns, 0);
 	atomic64_set(&xfs_wicache_global_mapping_check_ns, 0);
+	atomic64_set(&xfs_wicache_global_middle_calls, 0);
+	atomic64_set(&xfs_wicache_global_middle_bytes, 0);
+	atomic64_set(&xfs_wicache_global_middle_prepare_ns, 0);
+	atomic64_set(&xfs_wicache_global_middle_bvec_ns, 0);
+	atomic64_set(&xfs_wicache_global_middle_dio_ns, 0);
+	atomic64_set(&xfs_wicache_global_middle_release_ns, 0);
+	atomic64_set(&xfs_wicache_global_middle_copy_calls, 0);
+	atomic64_set(&xfs_wicache_global_middle_copy_bytes, 0);
+	atomic64_set(&xfs_wicache_global_middle_copy_ns, 0);
+	atomic64_set(&xfs_wicache_global_middle_direct_calls, 0);
+	atomic64_set(&xfs_wicache_global_middle_direct_bytes, 0);
+	atomic64_set(&xfs_wicache_global_dio_pool_wait_calls, 0);
+	atomic64_set(&xfs_wicache_global_dio_pool_wait_ns, 0);
+}
+
+static void
+xfs_wicache_dio_pool_free(
+	struct xfs_wicache_mount *wm)
+{
+	unsigned int		i;
+	u64			bytes;
+
+	if (!wm->dio_slots)
+		return;
+
+	bytes = XFS_WICACHE_DIO_SLOTS *
+		(XFS_WICACHE_DIO_CHUNK +
+		 XFS_WICACHE_DIO_PAGES * sizeof(struct bio_vec) +
+		 sizeof(struct xfs_wicache_dio_slot));
+	for (i = 0; i < XFS_WICACHE_DIO_SLOTS; i++) {
+		vfree(wm->dio_slots[i].data);
+		kfree(wm->dio_slots[i].bvec);
+	}
+	kfree(wm->dio_slots);
+	wm->dio_slots = NULL;
+	atomic64_sub(bytes, &xfs_wicache_global_dio_pool_bytes);
+}
+
+static int
+xfs_wicache_dio_pool_init(
+	struct xfs_wicache_mount *wm,
+	gfp_t			gfp)
+{
+	struct xfs_wicache_dio_slot *slot;
+	unsigned int		i, j;
+	u64			bytes;
+
+	spin_lock_init(&wm->dio_slot_lock);
+	INIT_LIST_HEAD(&wm->dio_free_slots);
+	init_waitqueue_head(&wm->dio_slot_wait);
+	wm->dio_slots = kcalloc(XFS_WICACHE_DIO_SLOTS,
+			sizeof(*wm->dio_slots), XFS_WICACHE_ACCOUNT_GFP(gfp));
+	if (!wm->dio_slots)
+		return -ENOMEM;
+
+	for (i = 0; i < XFS_WICACHE_DIO_SLOTS; i++) {
+		slot = &wm->dio_slots[i];
+		slot->data = __vmalloc(XFS_WICACHE_DIO_CHUNK,
+				XFS_WICACHE_ACCOUNT_GFP(gfp) | __GFP_ZERO);
+		slot->bvec = kcalloc(XFS_WICACHE_DIO_PAGES,
+				sizeof(*slot->bvec),
+				XFS_WICACHE_ACCOUNT_GFP(gfp));
+		if (!slot->data || !slot->bvec)
+			goto out_free;
+		for (j = 0; j < XFS_WICACHE_DIO_PAGES; j++) {
+			slot->bvec[j].bv_page = vmalloc_to_page(
+					(char *)slot->data + (j << PAGE_SHIFT));
+			slot->bvec[j].bv_len = PAGE_SIZE;
+		}
+		INIT_LIST_HEAD(&slot->list);
+		list_add_tail(&slot->list, &wm->dio_free_slots);
+		wm->dio_slots_available++;
+	}
+
+	bytes = XFS_WICACHE_DIO_SLOTS *
+		(XFS_WICACHE_DIO_CHUNK +
+		 XFS_WICACHE_DIO_PAGES * sizeof(struct bio_vec) +
+		 sizeof(struct xfs_wicache_dio_slot));
+	atomic64_add(bytes, &xfs_wicache_global_dio_pool_bytes);
+	return 0;
+
+out_free:
+	for (i = 0; i < XFS_WICACHE_DIO_SLOTS; i++) {
+		vfree(wm->dio_slots[i].data);
+		kfree(wm->dio_slots[i].bvec);
+	}
+	kfree(wm->dio_slots);
+	wm->dio_slots = NULL;
+	return -ENOMEM;
+}
+
+struct xfs_wicache_dio_slot *
+xfs_wicache_dio_slot_get(
+	struct xfs_wicache_mount *wm)
+{
+	struct xfs_wicache_dio_slot *slot;
+	u64			start = 0;
+	int			ret;
+
+	for (;;) {
+		spin_lock(&wm->dio_slot_lock);
+		if (!list_empty(&wm->dio_free_slots)) {
+			slot = list_first_entry(&wm->dio_free_slots,
+					struct xfs_wicache_dio_slot, list);
+			list_del_init(&slot->list);
+			wm->dio_slots_available--;
+			spin_unlock(&wm->dio_slot_lock);
+			if (start)
+				atomic64_add(ktime_get_ns() - start,
+						&xfs_wicache_global_dio_pool_wait_ns);
+			return slot;
+		}
+		spin_unlock(&wm->dio_slot_lock);
+
+		if (!start) {
+			start = ktime_get_ns();
+			atomic64_inc(&xfs_wicache_global_dio_pool_wait_calls);
+		}
+		ret = wait_event_killable(wm->dio_slot_wait,
+				READ_ONCE(wm->dio_slots_available));
+		if (ret) {
+			atomic64_add(ktime_get_ns() - start,
+					&xfs_wicache_global_dio_pool_wait_ns);
+			return ERR_PTR(ret);
+		}
+	}
+}
+
+void
+xfs_wicache_dio_slot_put(
+	struct xfs_wicache_mount *wm,
+	struct xfs_wicache_dio_slot *slot)
+{
+	spin_lock(&wm->dio_slot_lock);
+	list_add_tail(&slot->list, &wm->dio_free_slots);
+	wm->dio_slots_available++;
+	spin_unlock(&wm->dio_slot_lock);
+	wake_up(&wm->dio_slot_wait);
 }
 
 struct xfs_wicache_mount *
@@ -763,8 +954,13 @@ xfs_wicache_mount_alloc(
 	}
 
 	xfs_wicache_reset_stats();
+	error = xfs_wicache_dio_pool_init(wm, gfp);
+	if (error)
+		goto out_io;
 	return wm;
 
+out_io:
+	destroy_workqueue(wm->io_wq);
 out_control:
 	destroy_workqueue(wm->control_wq);
 out_hash:
@@ -836,6 +1032,7 @@ xfs_wicache_mount_free(
 		wm->enabled = false;
 		destroy_workqueue(wm->control_wq);
 		destroy_workqueue(wm->io_wq);
+		xfs_wicache_dio_pool_free(wm);
 	}
 
 	/*

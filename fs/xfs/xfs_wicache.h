@@ -21,6 +21,7 @@
 #include <linux/xarray.h>
 
 struct file;
+struct bio_vec;
 struct folio;
 struct iov_iter;
 struct kiocb;
@@ -37,6 +38,9 @@ struct xfs_inode;
 #define XFS_WICACHE_VALID_SIZE		(XFS_WICACHE_VALID_LONGS * sizeof(unsigned long))
 #define XFS_WICACHE_FULL_MASK		((1UL << XFS_WICACHE_NR_SEGS) - 1)
 #define XFS_WICACHE_ACCOUNT_GFP(gfp)	((gfp) | __GFP_ACCOUNT)
+#define XFS_WICACHE_DIO_CHUNK		(4UL << 20)
+#define XFS_WICACHE_DIO_SLOTS		2
+#define XFS_WICACHE_DIO_PAGES		(XFS_WICACHE_DIO_CHUNK / PAGE_SIZE)
 
 enum xfs_wicache_entry_state {
 	XFS_WICACHE_ENTRY_DIRTY = 0,
@@ -106,6 +110,12 @@ struct xfs_wicache_inode {
 	struct rcu_head			rcu;
 };
 
+struct xfs_wicache_dio_slot {
+	struct list_head		list;
+	void				*data;
+	struct bio_vec			*bvec;
+};
+
 struct xfs_wicache_mount {
 	bool				enabled;
 	struct rhashtable		inode_table;
@@ -116,6 +126,11 @@ struct xfs_wicache_mount {
 	struct workqueue_struct		*io_wq;
 	atomic64_t			total_dirty_bytes;
 	wait_queue_head_t		dirty_wait;
+	spinlock_t			dio_slot_lock;
+	struct list_head		dio_free_slots;
+	wait_queue_head_t		dio_slot_wait;
+	unsigned int			dio_slots_available;
+	struct xfs_wicache_dio_slot	*dio_slots;
 };
 
 struct xfs_wicache_mount *xfs_wicache_mount_alloc(gfp_t gfp);
@@ -144,8 +159,15 @@ void xfs_wicache_read_unlock(struct xfs_wicache_inode *wi);
 void xfs_wicache_record_front_iolock(u64 ns);
 void xfs_wicache_record_mapping_check(u64 ns);
 unsigned long xfs_wicache_io_unit_bytes(void);
+bool xfs_wicache_user_dio_enabled(void);
 void xfs_wicache_record_middle_dio(size_t bytes, u64 prepare_ns,
 		u64 bvec_ns, u64 dio_ns, u64 release_ns);
+void xfs_wicache_record_middle_copy(size_t bytes, u64 copy_ns);
+void xfs_wicache_record_middle_direct(size_t bytes);
+struct xfs_wicache_dio_slot *xfs_wicache_dio_slot_get(
+		struct xfs_wicache_mount *wm);
+void xfs_wicache_dio_slot_put(struct xfs_wicache_mount *wm,
+		struct xfs_wicache_dio_slot *slot);
 
 ssize_t xfs_wicache_dio_read_folio(struct file *file, loff_t pos,
 		struct folio *folio);
@@ -157,6 +179,9 @@ ssize_t xfs_wicache_dio_write_folios(struct file *file, loff_t pos,
 		struct folio **folios, unsigned int nr);
 ssize_t xfs_wicache_dio_write_folios_timed(struct file *file, loff_t pos,
 		struct folio **folios, unsigned int nr, u64 *bvec_ns,
+		u64 *dio_ns);
+ssize_t xfs_wicache_dio_write_bvecs_timed(struct file *file, loff_t pos,
+		struct bio_vec *bvec, unsigned int nr, size_t count,
 		u64 *dio_ns);
 
 #endif /* __XFS_WICACHE_H__ */
