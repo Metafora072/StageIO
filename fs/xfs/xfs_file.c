@@ -1236,7 +1236,8 @@ xfs_file_wicache_write(
 	pos = iocb->ki_pos;
 	admission = xfs_wicache_admission_lock(wm, ip);
 	mutex_lock(admission);
-	if (IS_ALIGNED(pos, PAGE_SIZE) && IS_ALIGNED(count, PAGE_SIZE) &&
+	if (!(iocb->ki_flags & IOCB_DIRECT) &&
+	    IS_ALIGNED(pos, PAGE_SIZE) && IS_ALIGNED(count, PAGE_SIZE) &&
 	    !atomic64_read(&wm->total_dirty_bytes)) {
 		wi = NULL;
 		ret = xfs_file_buffered_write(iocb, from);
