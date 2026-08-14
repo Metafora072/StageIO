@@ -90,6 +90,9 @@ static atomic64_t xfs_wicache_global_middle_staged_dio_ns;
 static atomic64_t xfs_wicache_global_fragment_calls;
 static atomic64_t xfs_wicache_global_fragment_bytes;
 static atomic64_t xfs_wicache_global_fragment_ns;
+static atomic64_t xfs_wicache_global_small_write_calls;
+static atomic64_t xfs_wicache_global_small_write_bytes;
+static atomic64_t xfs_wicache_global_small_write_ns;
 static atomic64_t xfs_wicache_global_dio_pool_bytes;
 static atomic64_t xfs_wicache_global_dio_pool_wait_calls;
 static atomic64_t xfs_wicache_global_dio_pool_wait_ns;
@@ -248,6 +251,12 @@ module_param_cb(wicache_fragment_bytes, &xfs_wicache_atomic64_ops,
 		&xfs_wicache_global_fragment_bytes, 0444);
 module_param_cb(wicache_fragment_ns, &xfs_wicache_atomic64_ops,
 		&xfs_wicache_global_fragment_ns, 0444);
+module_param_cb(wicache_small_write_calls, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_small_write_calls, 0444);
+module_param_cb(wicache_small_write_bytes, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_small_write_bytes, 0444);
+module_param_cb(wicache_small_write_ns, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_small_write_ns, 0444);
 module_param_cb(wicache_dio_pool_bytes, &xfs_wicache_atomic64_ops,
 		&xfs_wicache_global_dio_pool_bytes, 0444);
 module_param_cb(wicache_dio_pool_wait_calls, &xfs_wicache_atomic64_ops,
@@ -313,6 +322,16 @@ xfs_wicache_record_fragment(
 	atomic64_inc(&xfs_wicache_global_fragment_calls);
 	atomic64_add(bytes, &xfs_wicache_global_fragment_bytes);
 	atomic64_add(ns, &xfs_wicache_global_fragment_ns);
+}
+
+void
+xfs_wicache_record_small_write(
+	size_t			bytes,
+	u64			ns)
+{
+	atomic64_inc(&xfs_wicache_global_small_write_calls);
+	atomic64_add(bytes, &xfs_wicache_global_small_write_bytes);
+	atomic64_add(ns, &xfs_wicache_global_small_write_ns);
 }
 
 static struct file *
@@ -527,6 +546,8 @@ xfs_wicache_entry_free_rcu(
 		kfree(entry->active_valid[i]);
 		kfree(entry->flushing_valid[i]);
 	}
+	if (entry->active_full)
+		folio_put(entry->active_full);
 	if (entry->prepared_folio)
 		folio_put(entry->prepared_folio);
 	if (WARN_ON_ONCE(entry->io_file))
@@ -613,6 +634,11 @@ xfs_wicache_entry_drop_buffers(
 					XFS_WICACHE_VALID_SIZE);
 		}
 	}
+	if (entry->active_full) {
+		folio_put(entry->active_full);
+		entry->active_full = NULL;
+		xfs_wicache_uncharge(wm, PAGE_SIZE);
+	}
 	if (entry->prepared_folio) {
 		folio_put(entry->prepared_folio);
 		entry->prepared_folio = NULL;
@@ -620,6 +646,7 @@ xfs_wicache_entry_drop_buffers(
 	}
 	entry->active_mask = 0;
 	entry->flushing_mask = 0;
+	entry->flushing_full = false;
 	file = entry->io_file;
 	entry->io_file = NULL;
 	entry->state = XFS_WICACHE_ENTRY_INVALID;
@@ -1248,6 +1275,67 @@ xfs_wicache_can_stage(
 }
 
 static int
+xfs_wicache_stage_full(
+	struct xfs_wicache_entry *entry,
+	struct iov_iter		*from)
+{
+	struct xfs_wicache_mount *wm = entry->wi->wm;
+	struct folio		*folio, *old;
+	struct iov_iter		iter;
+	void			*addr;
+	size_t			copied;
+	unsigned int		i;
+	int			error;
+
+	error = xfs_wicache_charge(wm, PAGE_SIZE, true);
+	if (error)
+		return error;
+	folio = folio_alloc(XFS_WICACHE_ACCOUNT_GFP(GFP_NOFS), 0);
+	if (!folio) {
+		xfs_wicache_uncharge(wm, PAGE_SIZE);
+		return -ENOMEM;
+	}
+	iter = *from;
+	addr = kmap_local_folio(folio, 0);
+	copied = copy_from_iter(addr, PAGE_SIZE, &iter);
+	kunmap_local(addr);
+	if (copied != PAGE_SIZE) {
+		folio_put(folio);
+		xfs_wicache_uncharge(wm, PAGE_SIZE);
+		return -EFAULT;
+	}
+
+	mutex_lock(&entry->lock);
+	if (entry->state == XFS_WICACHE_ENTRY_INVALID) {
+		mutex_unlock(&entry->lock);
+		folio_put(folio);
+		xfs_wicache_uncharge(wm, PAGE_SIZE);
+		return -EAGAIN;
+	}
+	old = entry->active_full;
+	entry->active_full = folio;
+	for (i = 0; i < XFS_WICACHE_NR_SEGS; i++) {
+		if (!entry->active[i])
+			continue;
+		kfree(entry->active[i]);
+		bitmap_free(entry->active_valid[i]);
+		entry->active[i] = NULL;
+		entry->active_valid[i] = NULL;
+		xfs_wicache_uncharge(wm, XFS_WICACHE_SEG_SIZE +
+				XFS_WICACHE_VALID_SIZE);
+	}
+	entry->active_mask = 0;
+	entry->seq = atomic64_inc_return(&entry->wi->seq);
+	iov_iter_advance(from, PAGE_SIZE);
+	mutex_unlock(&entry->lock);
+	if (old) {
+		folio_put(old);
+		xfs_wicache_uncharge(wm, PAGE_SIZE);
+	}
+	return 0;
+}
+
+static int
 xfs_wicache_stage_chunk(
 	struct xfs_wicache_entry *entry,
 	unsigned int		seg,
@@ -1266,6 +1354,21 @@ xfs_wicache_stage_chunk(
 	if (entry->state == XFS_WICACHE_ENTRY_INVALID) {
 		mutex_unlock(&entry->lock);
 		return -EAGAIN;
+	}
+	if (entry->active_full) {
+		void *addr = kmap_local_folio(entry->active_full, 0);
+
+		iter = *from;
+		copied = copy_from_iter(addr +
+				(seg << XFS_WICACHE_SEG_SHIFT) + offset,
+				bytes, &iter);
+		kunmap_local(addr);
+		if (copied == bytes) {
+			entry->seq = atomic64_inc_return(&entry->wi->seq);
+			iov_iter_advance(from, bytes);
+		}
+		mutex_unlock(&entry->lock);
+		return copied == bytes ? 0 : -EFAULT;
 	}
 	if (entry->active[seg] && entry->active_valid[seg]) {
 		iter = *from;
@@ -1355,6 +1458,11 @@ xfs_wicache_stage_iter(
 		size_t bytes = min_t(size_t, count - written,
 				XFS_WICACHE_SEG_SIZE - chunk_offset);
 		struct xfs_wicache_entry *entry;
+		bool full = !offset_in_page(pos + written) &&
+				count - written >= PAGE_SIZE;
+
+		if (full)
+			bytes = PAGE_SIZE;
 
 retry_entry:
 		entry = xfs_wicache_get_or_create_entry(wi, file, index);
@@ -1362,8 +1470,11 @@ retry_entry:
 			error = PTR_ERR(entry);
 			break;
 		}
-		error = xfs_wicache_stage_chunk(entry, seg, chunk_offset,
-				bytes, from);
+		if (full)
+			error = xfs_wicache_stage_full(entry, from);
+		else
+			error = xfs_wicache_stage_chunk(entry, seg, chunk_offset,
+					bytes, from);
 		if (error == -EAGAIN) {
 			xfs_wicache_entry_put(entry);
 			cond_resched();
@@ -1376,7 +1487,8 @@ retry_entry:
 			bool			empty;
 
 			mutex_lock(&entry->lock);
-			empty = !entry->active_mask && !entry->flushing_mask;
+			empty = !entry->active_mask && !entry->flushing_mask &&
+				!entry->active_full && !entry->prepared_folio;
 			if (empty) {
 				entry->state = XFS_WICACHE_ENTRY_INVALID;
 				owned_file = entry->io_file;
@@ -1397,6 +1509,34 @@ retry_entry:
 	atomic64_add(written, &xfs_wicache_global_accepted_bytes);
 	atomic64_add(written, &wi->dirty_bytes);
 	return written ? written : error;
+}
+
+static int
+xfs_wicache_overlay_folio(
+	struct xfs_wicache_entry *entry,
+	struct folio		*folio,
+	struct iov_iter		*to,
+	loff_t			pos,
+	size_t			count)
+{
+	loff_t page_start = (loff_t)entry->page_index << PAGE_SHIFT;
+	loff_t copy_start = max_t(loff_t, pos, page_start);
+	loff_t copy_end = min_t(loff_t, pos + count, page_start + PAGE_SIZE);
+	struct iov_iter dst = *to;
+	void *addr;
+	size_t bytes;
+
+	if (!folio || copy_start >= copy_end)
+		return 0;
+	bytes = copy_end - copy_start;
+	iov_iter_advance(&dst, copy_start - pos);
+	addr = kmap_local_folio(folio, 0);
+	if (copy_to_iter(addr + copy_start - page_start, bytes, &dst) != bytes) {
+		kunmap_local(addr);
+		return -EFAULT;
+	}
+	kunmap_local(addr);
+	return 0;
 }
 
 static int
@@ -1460,9 +1600,16 @@ xfs_wicache_overlay_iter(
 		if (!entry)
 			continue;
 		mutex_lock(&entry->lock);
-		error = xfs_wicache_overlay_data(entry, entry->flushing,
+		if (entry->flushing_full)
+			error = xfs_wicache_overlay_folio(entry,
+					entry->prepared_folio, to, pos, count);
+		if (!error)
+			error = xfs_wicache_overlay_data(entry, entry->flushing,
 				entry->flushing_valid,
 				entry->flushing_mask, to, pos, count);
+		if (!error)
+			error = xfs_wicache_overlay_folio(entry,
+					entry->active_full, to, pos, count);
 		if (!error)
 			error = xfs_wicache_overlay_data(entry, entry->active,
 					entry->active_valid,
@@ -1652,10 +1799,22 @@ xfs_wicache_prepare_entry(
 
 	mutex_lock(&entry->lock);
 	if (entry->state == XFS_WICACHE_ENTRY_INVALID ||
-	    !entry->active_mask || entry->flushing_mask ||
+	    (!entry->active_mask && !entry->active_full) ||
+	    entry->flushing_mask ||
 	    entry->prepared_folio) {
 		ret = -EAGAIN;
 		goto out_unlock;
+	}
+	if (entry->active_full) {
+		entry->prepared_folio = entry->active_full;
+		entry->active_full = NULL;
+		entry->prepared_charged = true;
+		entry->flushing_full = true;
+		entry->state = XFS_WICACHE_ENTRY_FLUSHING;
+		entry->prepare_error = 0;
+		atomic64_inc(&xfs_wicache_global_full_cancels);
+		mutex_unlock(&entry->lock);
+		return 0;
 	}
 	for (i = 0; i < XFS_WICACHE_NR_SEGS; i++) {
 		entry->flushing[i] = entry->active[i];
@@ -1895,6 +2054,41 @@ xfs_wicache_batch_dispatch_work(
 }
 
 static void
+xfs_wicache_merge_active_into_full(
+	struct xfs_wicache_entry *entry,
+	struct folio		*folio)
+{
+	struct xfs_wicache_mount *wm = entry->wi->wm;
+	void			*addr = kmap_local_folio(folio, 0);
+	unsigned int		i, bit;
+
+	for_each_set_bit(i, &entry->active_mask, XFS_WICACHE_NR_SEGS) {
+		if (!entry->active[i] || !entry->active_valid[i])
+			continue;
+		bit = find_first_bit(entry->active_valid[i],
+				XFS_WICACHE_SEG_SIZE);
+		while (bit < XFS_WICACHE_SEG_SIZE) {
+			unsigned int run_end = find_next_zero_bit(
+					entry->active_valid[i],
+					XFS_WICACHE_SEG_SIZE, bit);
+
+			memcpy(addr + (i << XFS_WICACHE_SEG_SHIFT) + bit,
+					entry->active[i] + bit, run_end - bit);
+			bit = find_next_bit(entry->active_valid[i],
+					XFS_WICACHE_SEG_SIZE, run_end);
+		}
+		kfree(entry->active[i]);
+		bitmap_free(entry->active_valid[i]);
+		entry->active[i] = NULL;
+		entry->active_valid[i] = NULL;
+		xfs_wicache_uncharge(wm, XFS_WICACHE_SEG_SIZE +
+				XFS_WICACHE_VALID_SIZE);
+	}
+	entry->active_mask = 0;
+	kunmap_local(addr);
+}
+
+static void
 xfs_wicache_finish_entry(
 	struct xfs_wicache_entry *entry)
 {
@@ -1904,6 +2098,7 @@ xfs_wicache_finish_entry(
 	struct file		*owned_file = NULL;
 	ssize_t			ret;
 	bool			folio_charged;
+	bool			flushing_full;
 	bool			remove = false, requeue = false;
 	unsigned int		i, bit;
 	u64			flush_bytes = 0;
@@ -1913,6 +2108,8 @@ xfs_wicache_finish_entry(
 	entry->prepared_folio = NULL;
 	folio_charged = entry->prepared_charged;
 	entry->prepared_charged = false;
+	flushing_full = entry->flushing_full;
+	entry->flushing_full = false;
 	ret = entry->prepare_error;
 	entry->prepare_error = 0;
 	mutex_unlock(&entry->lock);
@@ -1922,6 +2119,8 @@ xfs_wicache_finish_entry(
 
 	mutex_lock(&entry->lock);
 	if (ret == PAGE_SIZE) {
+		if (flushing_full)
+			flush_bytes += PAGE_SIZE;
 		for (i = 0; i < XFS_WICACHE_NR_SEGS; i++) {
 			if (!entry->flushing[i])
 				continue;
@@ -1939,7 +2138,7 @@ xfs_wicache_finish_entry(
 		entry->flushing_mask = 0;
 		atomic64_add(flush_bytes, &xfs_wicache_global_drained_bytes);
 
-		if (entry->active_mask) {
+		if (entry->active_mask || entry->active_full) {
 			entry->state = XFS_WICACHE_ENTRY_DIRTY;
 			requeue = true;
 		} else {
@@ -1948,11 +2147,28 @@ xfs_wicache_finish_entry(
 			entry->io_file = NULL;
 			remove = true;
 		}
+	} else if (flushing_full) {
+		if (!entry->active_full) {
+			xfs_wicache_merge_active_into_full(entry, folio);
+			entry->active_full = folio;
+			folio = NULL;
+			folio_charged = false;
+		}
+		entry->flushing_mask = 0;
+		entry->state = XFS_WICACHE_ENTRY_DIRTY;
+		atomic64_inc(&xfs_wicache_global_flush_errors);
+		requeue = true;
 	} else {
 		for (i = 0; i < XFS_WICACHE_NR_SEGS; i++) {
 			if (!entry->flushing[i])
 				continue;
-			if (entry->active[i] && entry->active_valid[i]) {
+			if (entry->active_full) {
+				kfree(entry->flushing[i]);
+				bitmap_free(entry->flushing_valid[i]);
+				xfs_wicache_uncharge(wm,
+						XFS_WICACHE_SEG_SIZE +
+						XFS_WICACHE_VALID_SIZE);
+			} else if (entry->active[i] && entry->active_valid[i]) {
 				for_each_set_bit(bit, entry->flushing_valid[i],
 						XFS_WICACHE_SEG_SIZE) {
 					if (test_bit(bit, entry->active_valid[i]))

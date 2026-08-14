@@ -1068,7 +1068,8 @@ xfs_file_wicache_stage_part(
 	struct xfs_wicache_inode *wi,
 	struct kiocb		*iocb,
 	struct iov_iter		*from,
-	size_t			count)
+	size_t			count,
+	bool			small_write)
 {
 	struct xfs_inode	*ip = XFS_I(file_inode(iocb->ki_filp));
 	struct iov_iter		part = *from;
@@ -1079,8 +1080,12 @@ xfs_file_wicache_stage_part(
 	start = ktime_get_ns();
 	ret = xfs_wicache_stage_iter(wi, iocb->ki_filp, &part,
 			iocb->ki_pos, count);
-	xfs_wicache_record_fragment(ret > 0 ? ret : 0,
-			ktime_get_ns() - start);
+	if (small_write)
+		xfs_wicache_record_small_write(ret > 0 ? ret : 0,
+				ktime_get_ns() - start);
+	else
+		xfs_wicache_record_fragment(ret > 0 ? ret : 0,
+				ktime_get_ns() - start);
 	if (ret > 0) {
 		iov_iter_advance(from, ret);
 		iocb->ki_pos += ret;
@@ -1369,6 +1374,7 @@ xfs_file_wicache_write(
 	ssize_t			ret;
 	bool			has_entry;
 	bool			aligned;
+	bool			small_write;
 	bool			written;
 	u64			start;
 
@@ -1378,6 +1384,7 @@ xfs_file_wicache_write(
 	pos = iocb->ki_pos;
 	aligned = IS_ALIGNED(pos, PAGE_SIZE) &&
 		  IS_ALIGNED(count, PAGE_SIZE);
+	small_write = count <= XFS_WICACHE_SMALL_WRITE_MAX;
 	admission = xfs_wicache_admission_lock(wm, ip);
 	mutex_lock(admission);
 	wi = xfs_wicache_inode_lookup(wm, ip);
@@ -1399,7 +1406,7 @@ xfs_file_wicache_write(
 		goto out_admission;
 	}
 	/* Keep complete-page writes out of the dirty page cache. */
-	if (aligned) {
+	if (aligned && !small_write) {
 		if (has_entry) {
 			ret = xfs_wicache_inode_drain(wi);
 			if (ret)
@@ -1412,7 +1419,8 @@ xfs_file_wicache_write(
 		ret = xfs_file_wicache_dio_part(iocb, from, count);
 		goto out_admission;
 	}
-	if (has_entry && offset_in_page(pos) + count > PAGE_SIZE) {
+	if (has_entry && !small_write &&
+	    offset_in_page(pos) + count > PAGE_SIZE) {
 		ret = xfs_wicache_inode_drain(wi);
 		if (ret)
 			goto out_admission;
@@ -1471,6 +1479,10 @@ xfs_file_wicache_write(
 	}
 	xfs_iunlock(ip, iolock);
 	iolock = 0;
+	if (small_write) {
+		ret = xfs_file_wicache_stage_part(wi, iocb, from, count, true);
+		goto out_admission;
+	}
 
 	io_unit = xfs_wicache_io_unit_bytes();
 	head = (pos & (io_unit - 1)) ?
@@ -1479,7 +1491,7 @@ xfs_file_wicache_write(
 	tail = count - head - middle;
 
 	if (head) {
-		ret = xfs_file_wicache_stage_part(wi, iocb, from, head);
+		ret = xfs_file_wicache_stage_part(wi, iocb, from, head, false);
 		if (ret <= 0)
 			goto out_admission;
 		done += ret;
@@ -1495,7 +1507,7 @@ xfs_file_wicache_write(
 			goto out_partial;
 	}
 	if (tail) {
-		ret = xfs_file_wicache_stage_part(wi, iocb, from, tail);
+		ret = xfs_file_wicache_stage_part(wi, iocb, from, tail, false);
 		if (ret <= 0)
 			goto out_partial;
 		done += ret;

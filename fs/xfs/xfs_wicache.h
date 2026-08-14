@@ -39,6 +39,7 @@ struct xfs_inode;
 #define XFS_WICACHE_DIO_SLOTS		2
 #define XFS_WICACHE_DIO_SLOT_PAGES	(XFS_WICACHE_DIO_SLOT_SIZE / PAGE_SIZE)
 #define XFS_WICACHE_XA_DIRTY		XA_MARK_0
+#define XFS_WICACHE_SMALL_WRITE_MAX	(16UL << 10)
 
 enum xfs_wicache_entry_state {
 	XFS_WICACHE_ENTRY_DIRTY = 0,
@@ -65,8 +66,10 @@ struct xfs_wicache_entry {
 	unsigned long			*flushing_valid[XFS_WICACHE_NR_SEGS];
 	unsigned long			active_mask;
 	unsigned long			flushing_mask;
+	struct folio			*active_full;
 	struct folio			*prepared_folio;
 	bool				prepared_charged;
+	bool				flushing_full;
 	struct xfs_wicache_batch	*batch;
 	int				prepare_error;
 	u64				seq;
@@ -154,6 +157,7 @@ void xfs_wicache_record_middle_copy(size_t bytes, u64 copy_ns);
 void xfs_wicache_record_middle_direct(size_t bytes, u64 dio_ns);
 void xfs_wicache_record_middle_staged(size_t bytes, u64 dio_ns);
 void xfs_wicache_record_fragment(size_t bytes, u64 ns);
+void xfs_wicache_record_small_write(size_t bytes, u64 ns);
 struct xfs_wicache_dio_slot *xfs_wicache_dio_slot_get(
 		struct xfs_wicache_mount *wm);
 void xfs_wicache_dio_slot_put(struct xfs_wicache_mount *wm,
