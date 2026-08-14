@@ -163,7 +163,9 @@ bool xfs_wicache_user_dio_enabled(void);
 void xfs_wicache_record_middle_dio(size_t bytes, u64 prepare_ns,
 		u64 bvec_ns, u64 dio_ns, u64 release_ns);
 void xfs_wicache_record_middle_copy(size_t bytes, u64 copy_ns);
-void xfs_wicache_record_middle_direct(size_t bytes);
+void xfs_wicache_record_middle_direct(size_t bytes, u64 dio_ns);
+void xfs_wicache_record_middle_staged(size_t bytes, u64 dio_ns);
+void xfs_wicache_record_fragment(size_t bytes, u64 ns);
 struct xfs_wicache_dio_slot *xfs_wicache_dio_slot_get(
 		struct xfs_wicache_mount *wm);
 void xfs_wicache_dio_slot_put(struct xfs_wicache_mount *wm,

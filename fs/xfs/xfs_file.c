@@ -1073,10 +1073,14 @@ xfs_file_wicache_stage_part(
 	struct xfs_inode	*ip = XFS_I(file_inode(iocb->ki_filp));
 	struct iov_iter		part = *from;
 	ssize_t			ret;
+	u64			start;
 
 	iov_iter_truncate(&part, count);
+	start = ktime_get_ns();
 	ret = xfs_wicache_stage_iter(wi, iocb->ki_filp, &part,
 			iocb->ki_pos, count);
+	xfs_wicache_record_fragment(ret > 0 ? ret : 0,
+			ktime_get_ns() - start);
 	if (ret > 0) {
 		iov_iter_advance(from, ret);
 		iocb->ki_pos += ret;
@@ -1147,7 +1151,7 @@ xfs_file_wicache_dio_chunk(
 	    xfs_file_wicache_user_dio_aligned(iocb, from, count)) {
 		ret = xfs_file_wicache_user_dio_chunk(iocb, from, count,
 				&dio_ns);
-		xfs_wicache_record_middle_direct(count);
+		xfs_wicache_record_middle_direct(count, dio_ns);
 		xfs_wicache_record_middle_dio(count, 0, 0, dio_ns, 0);
 		return ret;
 	}
@@ -1172,6 +1176,7 @@ xfs_file_wicache_dio_chunk(
 	prepare_ns = ktime_get_ns() - start;
 	ret = xfs_wicache_dio_write_bvecs_timed(iocb->ki_filp,
 			iocb->ki_pos, slot->bvec, nr, count, &dio_ns);
+	xfs_wicache_record_middle_staged(count, dio_ns);
 	if (ret > 0) {
 		iov_iter_advance(from, ret);
 		iocb->ki_pos += ret;

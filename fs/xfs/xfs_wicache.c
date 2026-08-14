@@ -83,6 +83,13 @@ static atomic64_t xfs_wicache_global_middle_copy_bytes;
 static atomic64_t xfs_wicache_global_middle_copy_ns;
 static atomic64_t xfs_wicache_global_middle_direct_calls;
 static atomic64_t xfs_wicache_global_middle_direct_bytes;
+static atomic64_t xfs_wicache_global_middle_direct_dio_ns;
+static atomic64_t xfs_wicache_global_middle_staged_calls;
+static atomic64_t xfs_wicache_global_middle_staged_bytes;
+static atomic64_t xfs_wicache_global_middle_staged_dio_ns;
+static atomic64_t xfs_wicache_global_fragment_calls;
+static atomic64_t xfs_wicache_global_fragment_bytes;
+static atomic64_t xfs_wicache_global_fragment_ns;
 static atomic64_t xfs_wicache_global_dio_pool_bytes;
 static atomic64_t xfs_wicache_global_dio_pool_wait_calls;
 static atomic64_t xfs_wicache_global_dio_pool_wait_ns;
@@ -225,6 +232,20 @@ module_param_cb(wicache_middle_direct_calls, &xfs_wicache_atomic64_ops,
 		&xfs_wicache_global_middle_direct_calls, 0444);
 module_param_cb(wicache_middle_direct_bytes, &xfs_wicache_atomic64_ops,
 		&xfs_wicache_global_middle_direct_bytes, 0444);
+module_param_cb(wicache_middle_direct_dio_ns, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_middle_direct_dio_ns, 0444);
+module_param_cb(wicache_middle_staged_calls, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_middle_staged_calls, 0444);
+module_param_cb(wicache_middle_staged_bytes, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_middle_staged_bytes, 0444);
+module_param_cb(wicache_middle_staged_dio_ns, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_middle_staged_dio_ns, 0444);
+module_param_cb(wicache_fragment_calls, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_fragment_calls, 0444);
+module_param_cb(wicache_fragment_bytes, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_fragment_bytes, 0444);
+module_param_cb(wicache_fragment_ns, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_fragment_ns, 0444);
 module_param_cb(wicache_dio_pool_bytes, &xfs_wicache_atomic64_ops,
 		&xfs_wicache_global_dio_pool_bytes, 0444);
 module_param_cb(wicache_dio_pool_wait_calls, &xfs_wicache_atomic64_ops,
@@ -260,10 +281,32 @@ xfs_wicache_record_middle_copy(
 
 void
 xfs_wicache_record_middle_direct(
-	size_t			bytes)
+	size_t			bytes,
+	u64			dio_ns)
 {
 	atomic64_inc(&xfs_wicache_global_middle_direct_calls);
 	atomic64_add(bytes, &xfs_wicache_global_middle_direct_bytes);
+	atomic64_add(dio_ns, &xfs_wicache_global_middle_direct_dio_ns);
+}
+
+void
+xfs_wicache_record_middle_staged(
+	size_t			bytes,
+	u64			dio_ns)
+{
+	atomic64_inc(&xfs_wicache_global_middle_staged_calls);
+	atomic64_add(bytes, &xfs_wicache_global_middle_staged_bytes);
+	atomic64_add(dio_ns, &xfs_wicache_global_middle_staged_dio_ns);
+}
+
+void
+xfs_wicache_record_fragment(
+	size_t			bytes,
+	u64			ns)
+{
+	atomic64_inc(&xfs_wicache_global_fragment_calls);
+	atomic64_add(bytes, &xfs_wicache_global_fragment_bytes);
+	atomic64_add(ns, &xfs_wicache_global_fragment_ns);
 }
 
 static struct file *
@@ -779,6 +822,13 @@ xfs_wicache_reset_stats(void)
 	atomic64_set(&xfs_wicache_global_middle_copy_ns, 0);
 	atomic64_set(&xfs_wicache_global_middle_direct_calls, 0);
 	atomic64_set(&xfs_wicache_global_middle_direct_bytes, 0);
+	atomic64_set(&xfs_wicache_global_middle_direct_dio_ns, 0);
+	atomic64_set(&xfs_wicache_global_middle_staged_calls, 0);
+	atomic64_set(&xfs_wicache_global_middle_staged_bytes, 0);
+	atomic64_set(&xfs_wicache_global_middle_staged_dio_ns, 0);
+	atomic64_set(&xfs_wicache_global_fragment_calls, 0);
+	atomic64_set(&xfs_wicache_global_fragment_bytes, 0);
+	atomic64_set(&xfs_wicache_global_fragment_ns, 0);
 	atomic64_set(&xfs_wicache_global_dio_pool_wait_calls, 0);
 	atomic64_set(&xfs_wicache_global_dio_pool_wait_ns, 0);
 }
