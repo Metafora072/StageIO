@@ -397,6 +397,19 @@ xfs_wicache_temp_file_put(
 	fput(file);
 }
 
+static struct file *
+xfs_wicache_inode_temp_file_get(
+	struct xfs_wicache_inode *wi)
+{
+	struct file		*file = NULL;
+
+	spin_lock(&wi->file_lock);
+	if (wi->io_file)
+		file = xfs_wicache_temp_file_get(wi->io_file);
+	spin_unlock(&wi->file_lock);
+	return file;
+}
+
 struct xfs_wicache_batch {
 	struct work_struct		dispatch_work;
 	atomic_t			prepare_pending;
@@ -405,9 +418,23 @@ struct xfs_wicache_batch {
 	struct xfs_wicache_entry	*entries[];
 };
 
+struct xfs_wicache_raw_item {
+	pgoff_t			page_index;
+	struct folio			*folio;
+};
+
+struct xfs_wicache_raw_batch {
+	struct work_struct		dispatch_work;
+	struct xfs_wicache_inode	*wi;
+	struct file			*file;
+	unsigned int			nr;
+	struct xfs_wicache_raw_item	items[];
+};
+
 static void xfs_wicache_entry_prepare_work(struct work_struct *work);
 static void xfs_wicache_finish_entry(struct xfs_wicache_entry *entry);
 static void xfs_wicache_batch_dispatch_work(struct work_struct *work);
+static void xfs_wicache_raw_batch_dispatch_work(struct work_struct *work);
 static void xfs_wicache_inode_flush_work(struct work_struct *work);
 static void xfs_wicache_remove_entry(struct xfs_wicache_entry *entry);
 static void xfs_wicache_raw_entry_del(void);
@@ -1268,6 +1295,31 @@ xfs_wicache_lookup_full(
 	return folio;
 }
 
+static bool
+xfs_wicache_raw_is_flushing(
+	struct xfs_wicache_inode *wi,
+	pgoff_t		page_index)
+{
+	XA_STATE(xas, &wi->entries, page_index);
+	bool			flushing;
+
+	xas_lock(&xas);
+	flushing = xas_load(&xas) &&
+			xas_get_mark(&xas, XFS_WICACHE_XA_FULL) &&
+			xas_get_mark(&xas, XFS_WICACHE_XA_FLUSHING);
+	xas_unlock(&xas);
+	return flushing;
+}
+
+static void
+xfs_wicache_wait_raw_flush(
+	struct xfs_wicache_inode *wi,
+	pgoff_t		page_index)
+{
+	wait_event(wi->wm->dirty_wait,
+			!xfs_wicache_raw_is_flushing(wi, page_index));
+}
+
 static void
 xfs_wicache_raw_entry_add(void)
 {
@@ -1323,6 +1375,17 @@ retry:
 	xas_lock(&xas);
 	node = xas_load(&xas);
 	if (node == folio && xas_get_mark(&xas, XFS_WICACHE_XA_FULL)) {
+		if (xas_get_mark(&xas, XFS_WICACHE_XA_FLUSHING)) {
+			struct file *held = entry->io_file;
+
+			entry->io_file = NULL;
+			xas_unlock(&xas);
+			xfs_wicache_owner_file_put(held);
+			xfs_wicache_entry_put(entry);
+			folio_put(folio);
+			xfs_wicache_wait_raw_flush(wi, page_index);
+			goto retry;
+		}
 		entry->active_full = folio;
 		xas_store(&xas, entry);
 		xas_clear_mark(&xas, XFS_WICACHE_XA_FULL);
@@ -1518,9 +1581,16 @@ xfs_wicache_stage_raw_full(
 		return -EFAULT;
 	}
 
+retry_store:
 	do {
 		xas_lock(&xas);
 		old = xas_load(&xas);
+		if (old && xas_get_mark(&xas, XFS_WICACHE_XA_FULL) &&
+		    xas_get_mark(&xas, XFS_WICACHE_XA_FLUSHING)) {
+			xas_unlock(&xas);
+			xfs_wicache_wait_raw_flush(wi, page_index);
+			goto retry_store;
+		}
 		if (old && !xas_get_mark(&xas, XFS_WICACHE_XA_FULL)) {
 			entry = old;
 			if (!xfs_wicache_entry_get(entry))
@@ -2477,38 +2547,173 @@ xfs_wicache_finish_entry(
 	xfs_wicache_entry_put(entry);
 }
 
-static int
-xfs_wicache_promote_raw_batch(
-	struct xfs_wicache_inode *wi,
-	unsigned int		limit)
+static void
+xfs_wicache_finish_raw_item(
+	struct xfs_wicache_raw_batch *batch,
+	struct xfs_wicache_raw_item *item,
+	ssize_t			ret)
 {
-	unsigned int		promoted = 0;
+	struct xfs_wicache_inode *wi = batch->wi;
+	XA_STATE(xas, &wi->entries, item->page_index);
+	void			*node;
+	bool			removed = false;
 
-	while (promoted < limit &&
-	       xa_marked(&wi->entries, XFS_WICACHE_XA_FULL)) {
-		XA_STATE(xas, &wi->entries, 0);
-		struct xfs_wicache_entry *entry;
-		pgoff_t		index = 0;
-		void			*node;
-
-		xas_lock(&xas);
-		node = xas_find_marked(&xas, ULONG_MAX,
-				XFS_WICACHE_XA_FULL);
-		if (node)
-			index = xas.xa_index;
-		xas_unlock(&xas);
-		if (!node)
-			break;
-		entry = xfs_wicache_promote_full(wi,
-				READ_ONCE(wi->io_file), index);
-		if (IS_ERR(entry))
-			return PTR_ERR(entry);
-		if (!entry)
-			continue;
-		xfs_wicache_entry_put(entry);
-		promoted++;
+	xas_lock(&xas);
+	node = xas_load(&xas);
+	if (node == item->folio &&
+	    xas_get_mark(&xas, XFS_WICACHE_XA_FULL) &&
+	    xas_get_mark(&xas, XFS_WICACHE_XA_FLUSHING)) {
+		if (ret == PAGE_SIZE) {
+			xas_store(&xas, NULL);
+			removed = true;
+		} else {
+			xas_clear_mark(&xas, XFS_WICACHE_XA_FLUSHING);
+			xas_set_mark(&xas, XFS_WICACHE_XA_DIRTY);
+		}
 	}
-	return 0;
+	xas_unlock(&xas);
+
+	if (removed) {
+		atomic64_dec(&wi->nr_entries);
+		atomic64_add(PAGE_SIZE, &xfs_wicache_global_drained_bytes);
+		atomic64_add(PAGE_SIZE,
+				&xfs_wicache_global_device_write_bytes);
+		xfs_wicache_raw_entry_del();
+		folio_put(item->folio);
+		xfs_wicache_uncharge(wi->wm, PAGE_SIZE);
+	} else if (ret != PAGE_SIZE) {
+		atomic64_inc(&xfs_wicache_global_flush_errors);
+	} else {
+		WARN_ON_ONCE(1);
+	}
+	folio_put(item->folio);
+	wake_up_all(&wi->wm->dirty_wait);
+}
+
+static void
+xfs_wicache_raw_batch_dispatch_work(
+	struct work_struct	*work)
+{
+	struct xfs_wicache_raw_batch *batch = container_of(work,
+			struct xfs_wicache_raw_batch, dispatch_work);
+	struct xfs_wicache_inode *wi = batch->wi;
+	struct folio		**folios;
+	unsigned int		first, i, nr;
+	ssize_t			ret;
+	u64			start;
+
+	folios = kcalloc(batch->nr, sizeof(*folios), GFP_NOFS);
+	if (!folios) {
+		for (i = 0; i < batch->nr; i++)
+			xfs_wicache_finish_raw_item(batch, &batch->items[i],
+					-ENOMEM);
+		goto out;
+	}
+
+	start = ktime_get_ns();
+	down_read(&wi->visibility_sem);
+	atomic64_add(ktime_get_ns() - start,
+			&xfs_wicache_global_visibility_wait_ns);
+	for (first = 0; first < batch->nr; first += nr) {
+		folios[0] = batch->items[first].folio;
+		for (nr = 1; first + nr < batch->nr; nr++) {
+			if (batch->items[first + nr].page_index !=
+			    batch->items[first].page_index + nr)
+				break;
+			folios[nr] = batch->items[first + nr].folio;
+		}
+
+		atomic64_inc(&xfs_wicache_global_dio_write_calls);
+		atomic64_add(nr, &xfs_wicache_global_dio_write_pages);
+		start = ktime_get_ns();
+		xfs_wicache_dio_start();
+		ret = xfs_wicache_dio_write_folios(batch->file,
+				(loff_t)batch->items[first].page_index <<
+				PAGE_SHIFT, folios, nr);
+		xfs_wicache_dio_finish();
+		atomic64_add(ktime_get_ns() - start,
+				&xfs_wicache_global_dio_write_ns);
+		if (ret != (ssize_t)nr << PAGE_SHIFT)
+			ret = ret < 0 ? ret : -EIO;
+		for (i = 0; i < nr; i++)
+			xfs_wicache_finish_raw_item(batch,
+					&batch->items[first + i],
+					ret < 0 ? ret : PAGE_SIZE);
+	}
+	up_read(&wi->visibility_sem);
+	kfree(folios);
+
+out:
+	xfs_wicache_inode_release_file_if_empty(wi);
+	xfs_wicache_temp_file_put(batch->file);
+	atomic_dec(&wi->batch_active);
+	if (atomic64_read(&wi->nr_entries))
+		xfs_wicache_kick_inode(wi, 0);
+	kfree(batch);
+}
+
+static bool
+xfs_wicache_queue_raw_batch(
+	struct xfs_wicache_inode *wi)
+{
+	struct xfs_wicache_raw_batch *batch;
+	XA_STATE(xas, &wi->entries, 0);
+	struct folio		*folio;
+	unsigned int		queued = 0;
+	int			active;
+	bool			more_dirty;
+
+	active = atomic_inc_return(&wi->batch_active);
+	xfs_wicache_update_batch_peak(active);
+	if (active > xfs_wicache_qd) {
+		atomic_dec(&wi->batch_active);
+		return false;
+	}
+	batch = kzalloc(struct_size(batch, items, xfs_wicache_batch),
+			XFS_WICACHE_ACCOUNT_GFP(GFP_NOFS));
+	if (!batch) {
+		atomic_dec(&wi->batch_active);
+		return false;
+	}
+	batch->wi = wi;
+	batch->file = xfs_wicache_inode_temp_file_get(wi);
+	if (!batch->file) {
+		kfree(batch);
+		atomic_dec(&wi->batch_active);
+		return false;
+	}
+
+	xas_lock(&xas);
+	xas_for_each_marked(&xas, folio, ULONG_MAX,
+			XFS_WICACHE_XA_DIRTY) {
+		if (!xas_get_mark(&xas, XFS_WICACHE_XA_FULL))
+			continue;
+		folio_get(folio);
+		xas_clear_mark(&xas, XFS_WICACHE_XA_DIRTY);
+		xas_set_mark(&xas, XFS_WICACHE_XA_FLUSHING);
+		batch->items[queued].page_index = xas.xa_index;
+		batch->items[queued].folio = folio;
+		if (++queued == xfs_wicache_batch)
+			break;
+	}
+	more_dirty = xa_marked(&wi->entries, XFS_WICACHE_XA_DIRTY);
+	xas_unlock(&xas);
+
+	if (!queued) {
+		xfs_wicache_temp_file_put(batch->file);
+		kfree(batch);
+		atomic_dec(&wi->batch_active);
+		return false;
+	}
+	batch->nr = queued;
+	atomic64_inc(&xfs_wicache_global_batches);
+	atomic64_add(queued, &xfs_wicache_global_batch_pages);
+	INIT_WORK(&batch->dispatch_work,
+			xfs_wicache_raw_batch_dispatch_work);
+	WARN_ON_ONCE(!queue_work(wi->wm->io_wq, &batch->dispatch_work));
+	if (more_dirty)
+		xfs_wicache_kick_inode(wi, 0);
+	return true;
 }
 
 static void
@@ -2522,14 +2727,11 @@ xfs_wicache_inode_flush_work(
 	XA_STATE(xas, &wi->entries, 0);
 	unsigned int		queued = 0, i;
 	u64			scan_start;
-	int			active, error;
+	int			active;
 	bool			more_dirty;
 
-	error = xfs_wicache_promote_raw_batch(wi, xfs_wicache_batch);
-	if (error) {
-		xfs_wicache_kick_inode(wi, 1);
+	if (xfs_wicache_queue_raw_batch(wi))
 		return;
-	}
 
 	active = atomic_inc_return(&wi->batch_active);
 	xfs_wicache_update_batch_peak(active);

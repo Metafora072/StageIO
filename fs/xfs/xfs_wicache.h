@@ -40,6 +40,7 @@ struct xfs_inode;
 #define XFS_WICACHE_DIO_SLOT_PAGES	(XFS_WICACHE_DIO_SLOT_SIZE / PAGE_SIZE)
 #define XFS_WICACHE_XA_DIRTY		XA_MARK_0
 #define XFS_WICACHE_XA_FULL		XA_MARK_1
+#define XFS_WICACHE_XA_FLUSHING		XA_MARK_2
 #define XFS_WICACHE_SMALL_WRITE_MAX	(16UL << 10)
 
 enum xfs_wicache_entry_state {
