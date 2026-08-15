@@ -1452,18 +1452,12 @@ xfs_wicache_mark_dirty(
 	struct xfs_wicache_entry *entry)
 {
 	struct xfs_wicache_inode *wi = entry->wi;
-	unsigned long		delay;
 
 	xa_lock(&wi->entries);
 	if (!entry->queued)
 		__xa_set_mark(&wi->entries, entry->page_index,
 				XFS_WICACHE_XA_DIRTY);
 	xa_unlock(&wi->entries);
-	delay = msecs_to_jiffies(xfs_wicache_delay_ms);
-	if (atomic64_read(&entry->wi->wm->total_dirty_bytes) >=
-	    xfs_wicache_high_bytes * 3 / 4)
-		delay = 0;
-	xfs_wicache_kick_inode(entry->wi, delay);
 }
 
 bool
@@ -1548,7 +1542,6 @@ xfs_wicache_stage_full(
 static int
 xfs_wicache_stage_raw_full(
 	struct xfs_wicache_inode *wi,
-	struct file		*file,
 	pgoff_t		page_index,
 	struct iov_iter		*from)
 {
@@ -1559,7 +1552,6 @@ xfs_wicache_stage_raw_full(
 	XA_STATE(xas, &wi->entries, page_index);
 	void			*addr, *old = NULL;
 	size_t			copied;
-	unsigned long		delay;
 	bool			inserted = false;
 	int			error;
 
@@ -1626,17 +1618,11 @@ retry_store:
 	if (inserted) {
 		atomic64_inc(&wi->nr_entries);
 		xfs_wicache_raw_entry_add();
-		xfs_wicache_inode_set_file(wi, file);
 	} else if (old_folio) {
 		folio_put(old_folio);
 		xfs_wicache_uncharge(wm, PAGE_SIZE);
 	}
 	iov_iter_advance(from, PAGE_SIZE);
-	delay = msecs_to_jiffies(xfs_wicache_delay_ms);
-	if (atomic64_read(&wm->total_dirty_bytes) >=
-	    xfs_wicache_high_bytes * 3 / 4)
-		delay = 0;
-	xfs_wicache_kick_inode(wi, delay);
 	return 0;
 }
 
@@ -1755,6 +1741,7 @@ xfs_wicache_stage_iter(
 	size_t			count)
 {
 	size_t			written = 0;
+	unsigned long		delay;
 	int			error = 0;
 
 	xfs_wicache_inode_set_file(wi, file);
@@ -1775,8 +1762,7 @@ xfs_wicache_stage_iter(
 			bytes = PAGE_SIZE;
 
 		if (full) {
-			error = xfs_wicache_stage_raw_full(wi, file, index,
-					from);
+			error = xfs_wicache_stage_raw_full(wi, index, from);
 			if (error == -EAGAIN) {
 				cond_resched();
 				continue;
@@ -1828,6 +1814,13 @@ retry_entry:
 
 	atomic64_add(written, &xfs_wicache_global_accepted_bytes);
 	atomic64_add(written, &wi->dirty_bytes);
+	if (written) {
+		delay = msecs_to_jiffies(xfs_wicache_delay_ms);
+		if (atomic64_read(&wi->wm->total_dirty_bytes) >=
+		    xfs_wicache_high_bytes * 3 / 4)
+			delay = 0;
+		xfs_wicache_kick_inode(wi, delay);
+	}
 	return written ? written : error;
 }
 
