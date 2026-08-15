@@ -93,6 +93,10 @@ static atomic64_t xfs_wicache_global_fragment_ns;
 static atomic64_t xfs_wicache_global_small_write_calls;
 static atomic64_t xfs_wicache_global_small_write_bytes;
 static atomic64_t xfs_wicache_global_small_write_ns;
+static atomic64_t xfs_wicache_global_stage_batch_calls;
+static atomic64_t xfs_wicache_global_stage_alloc_ns;
+static atomic64_t xfs_wicache_global_stage_copy_ns;
+static atomic64_t xfs_wicache_global_stage_store_ns;
 static atomic64_t xfs_wicache_global_dio_pool_bytes;
 static atomic64_t xfs_wicache_global_dio_pool_wait_calls;
 static atomic64_t xfs_wicache_global_dio_pool_wait_ns;
@@ -257,6 +261,14 @@ module_param_cb(wicache_small_write_bytes, &xfs_wicache_atomic64_ops,
 		&xfs_wicache_global_small_write_bytes, 0444);
 module_param_cb(wicache_small_write_ns, &xfs_wicache_atomic64_ops,
 		&xfs_wicache_global_small_write_ns, 0444);
+module_param_cb(wicache_stage_batch_calls, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_stage_batch_calls, 0444);
+module_param_cb(wicache_stage_alloc_ns, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_stage_alloc_ns, 0444);
+module_param_cb(wicache_stage_copy_ns, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_stage_copy_ns, 0444);
+module_param_cb(wicache_stage_store_ns, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_stage_store_ns, 0444);
 module_param_cb(wicache_dio_pool_bytes, &xfs_wicache_atomic64_ops,
 		&xfs_wicache_global_dio_pool_bytes, 0444);
 module_param_cb(wicache_dio_pool_wait_calls, &xfs_wicache_atomic64_ops,
@@ -880,6 +892,13 @@ xfs_wicache_reset_stats(void)
 	atomic64_set(&xfs_wicache_global_fragment_calls, 0);
 	atomic64_set(&xfs_wicache_global_fragment_bytes, 0);
 	atomic64_set(&xfs_wicache_global_fragment_ns, 0);
+	atomic64_set(&xfs_wicache_global_small_write_calls, 0);
+	atomic64_set(&xfs_wicache_global_small_write_bytes, 0);
+	atomic64_set(&xfs_wicache_global_small_write_ns, 0);
+	atomic64_set(&xfs_wicache_global_stage_batch_calls, 0);
+	atomic64_set(&xfs_wicache_global_stage_alloc_ns, 0);
+	atomic64_set(&xfs_wicache_global_stage_copy_ns, 0);
+	atomic64_set(&xfs_wicache_global_stage_store_ns, 0);
 	atomic64_set(&xfs_wicache_global_dio_pool_wait_calls, 0);
 	atomic64_set(&xfs_wicache_global_dio_pool_wait_ns, 0);
 	atomic64_set(&xfs_wicache_global_inode_records, 0);
@@ -1478,42 +1497,21 @@ xfs_wicache_can_stage(
 	return true;
 }
 
+#define XFS_WICACHE_STAGE_BATCH_PAGES	64
+#define XFS_WICACHE_STAGE_ALLOC_ORDER	6
+
 static int
-xfs_wicache_stage_full(
+xfs_wicache_stage_full_folio(
 	struct xfs_wicache_entry *entry,
-	struct iov_iter		*from)
+	struct folio		*folio)
 {
 	struct xfs_wicache_mount *wm = entry->wi->wm;
-	struct folio		*folio, *old;
-	struct iov_iter		iter;
-	void			*addr;
-	size_t			copied;
+	struct folio		*old;
 	unsigned int		i;
-	int			error;
-
-	error = xfs_wicache_charge(wm, PAGE_SIZE, true);
-	if (error)
-		return error;
-	folio = folio_alloc(XFS_WICACHE_ACCOUNT_GFP(GFP_NOFS), 0);
-	if (!folio) {
-		xfs_wicache_uncharge(wm, PAGE_SIZE);
-		return -ENOMEM;
-	}
-	iter = *from;
-	addr = kmap_local_folio(folio, 0);
-	copied = copy_from_iter(addr, PAGE_SIZE, &iter);
-	kunmap_local(addr);
-	if (copied != PAGE_SIZE) {
-		folio_put(folio);
-		xfs_wicache_uncharge(wm, PAGE_SIZE);
-		return -EFAULT;
-	}
 
 	mutex_lock(&entry->lock);
 	if (entry->state == XFS_WICACHE_ENTRY_INVALID) {
 		mutex_unlock(&entry->lock);
-		folio_put(folio);
-		xfs_wicache_uncharge(wm, PAGE_SIZE);
 		return -EAGAIN;
 	}
 	old = entry->active_full;
@@ -1530,7 +1528,6 @@ xfs_wicache_stage_full(
 	}
 	entry->active_mask = 0;
 	entry->seq = atomic64_inc_return(&entry->wi->seq);
-	iov_iter_advance(from, PAGE_SIZE);
 	mutex_unlock(&entry->lock);
 	if (old) {
 		folio_put(old);
@@ -1540,38 +1537,17 @@ xfs_wicache_stage_full(
 }
 
 static int
-xfs_wicache_stage_raw_full(
+xfs_wicache_store_raw_folio(
 	struct xfs_wicache_inode *wi,
 	pgoff_t		page_index,
-	struct iov_iter		*from)
+	struct folio		*folio)
 {
-	struct xfs_wicache_mount *wm = wi->wm;
 	struct xfs_wicache_entry *entry;
-	struct folio		*folio, *old_folio = NULL;
-	struct iov_iter		iter = *from;
+	struct folio		*old_folio = NULL;
 	XA_STATE(xas, &wi->entries, page_index);
-	void			*addr, *old = NULL;
-	size_t			copied;
+	void			*old = NULL;
 	bool			inserted = false;
 	int			error;
-
-	error = xfs_wicache_charge(wm, PAGE_SIZE, true);
-	if (error)
-		return error;
-	folio = folio_alloc(XFS_WICACHE_ACCOUNT_GFP(GFP_NOFS), 0);
-	if (!folio) {
-		xfs_wicache_uncharge(wm, PAGE_SIZE);
-		return -ENOMEM;
-	}
-	folio->index = page_index;
-	addr = kmap_local_folio(folio, 0);
-	copied = copy_from_iter(addr, PAGE_SIZE, &iter);
-	kunmap_local(addr);
-	if (copied != PAGE_SIZE) {
-		folio_put(folio);
-		xfs_wicache_uncharge(wm, PAGE_SIZE);
-		return -EFAULT;
-	}
 
 retry_store:
 	do {
@@ -1588,14 +1564,18 @@ retry_store:
 			if (!xfs_wicache_entry_get(entry))
 				entry = NULL;
 			xas_unlock(&xas);
-			folio_put(folio);
-			xfs_wicache_uncharge(wm, PAGE_SIZE);
-			if (!entry)
-				return -EAGAIN;
-			error = xfs_wicache_stage_full(entry, from);
+			if (!entry) {
+				cond_resched();
+				goto retry_store;
+			}
+			error = xfs_wicache_stage_full_folio(entry, folio);
 			if (!error)
 				xfs_wicache_mark_dirty(entry);
 			xfs_wicache_entry_put(entry);
+			if (error == -EAGAIN) {
+				cond_resched();
+				goto retry_store;
+			}
 			return error;
 		}
 		xas_store(&xas, folio);
@@ -1609,21 +1589,140 @@ retry_store:
 		xas_unlock(&xas);
 	} while (xas_nomem(&xas, XFS_WICACHE_ACCOUNT_GFP(GFP_NOFS)));
 	error = xas_error(&xas);
-	if (error) {
-		folio_put(folio);
-		xfs_wicache_uncharge(wm, PAGE_SIZE);
+	if (error)
 		return error;
-	}
 
 	if (inserted) {
 		atomic64_inc(&wi->nr_entries);
 		xfs_wicache_raw_entry_add();
 	} else if (old_folio) {
 		folio_put(old_folio);
-		xfs_wicache_uncharge(wm, PAGE_SIZE);
+		xfs_wicache_uncharge(wi->wm, PAGE_SIZE);
 	}
-	iov_iter_advance(from, PAGE_SIZE);
 	return 0;
+}
+
+static unsigned int
+xfs_wicache_alloc_stage_pages(
+	unsigned int		nr,
+	struct page		**pages)
+{
+	gfp_t gfp = XFS_WICACHE_ACCOUNT_GFP(GFP_NOFS);
+	unsigned int allocated = 0;
+
+	while (allocated < nr) {
+		unsigned int remaining = nr - allocated;
+		unsigned int order = min_t(unsigned int,
+				ilog2(remaining), XFS_WICACHE_STAGE_ALLOC_ORDER);
+		struct page *page = NULL;
+		unsigned int i;
+
+		while (order) {
+			page = alloc_pages(gfp | __GFP_NORETRY | __GFP_NOWARN,
+					order);
+			if (page)
+				break;
+			order--;
+		}
+		if (!page) {
+			page = alloc_page(gfp);
+			order = 0;
+		}
+		if (!page)
+			break;
+		if (order)
+			split_page(page, order);
+		for (i = 0; i < 1U << order; i++)
+			pages[allocated++] = page + i;
+	}
+	return allocated;
+}
+
+static ssize_t
+xfs_wicache_stage_raw_run(
+	struct xfs_wicache_inode *wi,
+	struct iov_iter		*from,
+	loff_t			pos,
+	size_t			count)
+{
+	struct xfs_wicache_mount *wm = wi->wm;
+	struct page		*pages[XFS_WICACHE_STAGE_BATCH_PAGES];
+	size_t			done = 0;
+	int			error = 0;
+
+	while (done < count) {
+		unsigned int nr = min_t(size_t,
+				(count - done) >> PAGE_SHIFT,
+				XFS_WICACHE_STAGE_BATCH_PAGES);
+		unsigned int allocated, stored = 0;
+		struct iov_iter iter = *from;
+		u64 start;
+		unsigned int i;
+
+		memset(pages, 0, sizeof(pages));
+		start = ktime_get_ns();
+		error = xfs_wicache_charge(wm, nr * PAGE_SIZE, true);
+		if (error)
+			break;
+		allocated = xfs_wicache_alloc_stage_pages(nr, pages);
+		atomic64_add(ktime_get_ns() - start,
+				&xfs_wicache_global_stage_alloc_ns);
+		if (allocated != nr) {
+			error = -ENOMEM;
+			goto out_release;
+		}
+
+		start = ktime_get_ns();
+		for (i = 0; i < nr; i++) {
+			struct folio *folio = page_folio(pages[i]);
+			void *addr = kmap_local_folio(folio, 0);
+
+			if (copy_from_iter(addr, PAGE_SIZE, &iter) != PAGE_SIZE)
+				error = -EFAULT;
+			kunmap_local(addr);
+			if (error)
+				break;
+		}
+		atomic64_add(ktime_get_ns() - start,
+				&xfs_wicache_global_stage_copy_ns);
+		if (error)
+			goto out_release;
+
+		start = ktime_get_ns();
+		for (i = 0; i < nr; i++) {
+			struct folio *folio = page_folio(pages[i]);
+
+			folio->index = (pos + done +
+					((loff_t)i << PAGE_SHIFT)) >> PAGE_SHIFT;
+			error = xfs_wicache_store_raw_folio(wi, folio->index,
+					folio);
+			if (error)
+				break;
+			pages[i] = NULL;
+			stored++;
+		}
+		atomic64_add(ktime_get_ns() - start,
+				&xfs_wicache_global_stage_store_ns);
+		atomic64_inc(&xfs_wicache_global_stage_batch_calls);
+
+out_release:
+		for (i = stored; i < allocated; i++) {
+			if (pages[i])
+				folio_put(page_folio(pages[i]));
+		}
+		if (stored != nr)
+			xfs_wicache_uncharge(wm,
+					(nr - stored) * PAGE_SIZE);
+		if (stored) {
+			size_t bytes = (size_t)stored << PAGE_SHIFT;
+
+			iov_iter_advance(from, bytes);
+			done += bytes;
+		}
+		if (error)
+			break;
+	}
+	return done ? done : error;
 }
 
 static int
@@ -1762,14 +1861,18 @@ xfs_wicache_stage_iter(
 			bytes = PAGE_SIZE;
 
 		if (full) {
-			error = xfs_wicache_stage_raw_full(wi, index, from);
-			if (error == -EAGAIN) {
-				cond_resched();
-				continue;
-			}
-			if (error)
+			size_t run = round_down(count - written, PAGE_SIZE);
+			ssize_t staged;
+
+			staged = xfs_wicache_stage_raw_run(wi, from,
+					pos + written, run);
+			if (staged <= 0) {
+				error = staged;
 				break;
-			written += bytes;
+			}
+			written += staged;
+			if (staged != run)
+				break;
 			continue;
 		}
 
