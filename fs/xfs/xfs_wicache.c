@@ -2652,7 +2652,13 @@ out:
 	kfree(batch);
 }
 
-static bool
+enum xfs_wicache_raw_queue_result {
+	XFS_WICACHE_RAW_NONE,
+	XFS_WICACHE_RAW_QUEUED,
+	XFS_WICACHE_RAW_BUSY,
+};
+
+static enum xfs_wicache_raw_queue_result
 xfs_wicache_queue_raw_batch(
 	struct xfs_wicache_inode *wi)
 {
@@ -2664,23 +2670,23 @@ xfs_wicache_queue_raw_batch(
 	bool			more_dirty;
 
 	active = atomic_inc_return(&wi->batch_active);
-	xfs_wicache_update_batch_peak(active);
 	if (active > xfs_wicache_qd) {
 		atomic_dec(&wi->batch_active);
-		return false;
+		return XFS_WICACHE_RAW_BUSY;
 	}
+	xfs_wicache_update_batch_peak(active);
 	batch = kzalloc(struct_size(batch, items, xfs_wicache_batch),
 			XFS_WICACHE_ACCOUNT_GFP(GFP_NOFS));
 	if (!batch) {
 		atomic_dec(&wi->batch_active);
-		return false;
+		return XFS_WICACHE_RAW_NONE;
 	}
 	batch->wi = wi;
 	batch->file = xfs_wicache_inode_temp_file_get(wi);
 	if (!batch->file) {
 		kfree(batch);
 		atomic_dec(&wi->batch_active);
-		return false;
+		return XFS_WICACHE_RAW_NONE;
 	}
 
 	xas_lock(&xas);
@@ -2703,7 +2709,7 @@ xfs_wicache_queue_raw_batch(
 		xfs_wicache_temp_file_put(batch->file);
 		kfree(batch);
 		atomic_dec(&wi->batch_active);
-		return false;
+		return XFS_WICACHE_RAW_NONE;
 	}
 	batch->nr = queued;
 	atomic64_inc(&xfs_wicache_global_batches);
@@ -2713,7 +2719,7 @@ xfs_wicache_queue_raw_batch(
 	WARN_ON_ONCE(!queue_work(wi->wm->io_wq, &batch->dispatch_work));
 	if (more_dirty)
 		xfs_wicache_kick_inode(wi, 0);
-	return true;
+	return XFS_WICACHE_RAW_QUEUED;
 }
 
 static void
@@ -2729,16 +2735,18 @@ xfs_wicache_inode_flush_work(
 	u64			scan_start;
 	int			active;
 	bool			more_dirty;
+	enum xfs_wicache_raw_queue_result raw_result;
 
-	if (xfs_wicache_queue_raw_batch(wi))
+	raw_result = xfs_wicache_queue_raw_batch(wi);
+	if (raw_result != XFS_WICACHE_RAW_NONE)
 		return;
 
 	active = atomic_inc_return(&wi->batch_active);
-	xfs_wicache_update_batch_peak(active);
 	if (active > xfs_wicache_qd) {
 		atomic_dec(&wi->batch_active);
 		return;
 	}
+	xfs_wicache_update_batch_peak(active);
 	batch = kzalloc(struct_size(batch, entries, xfs_wicache_batch),
 			XFS_WICACHE_ACCOUNT_GFP(GFP_NOFS));
 	if (!batch) {
