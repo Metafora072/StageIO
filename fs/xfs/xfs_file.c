@@ -30,6 +30,7 @@
 #include <linux/falloc.h>
 #include <linux/backing-dev.h>
 #include <linux/blkdev.h>
+#include <linux/completion.h>
 #include <linux/mman.h>
 #include <linux/fadvise.h>
 #include <linux/ktime.h>
@@ -1136,41 +1137,87 @@ xfs_file_wicache_user_dio_aligned(
 	return bdev_iter_is_aligned(target->bt_bdev, &part);
 }
 
-#define XFS_WICACHE_PIPE_CHUNK	(1UL << 20)
+#define XFS_WICACHE_PIPE_CHUNK	(2UL << 20)
 
-struct xfs_file_wicache_dio_work {
-	struct work_struct	work;
-	struct file		*file;
-	struct bio_vec		*bvec;
-	loff_t			pos;
+struct xfs_file_wicache_async_dio {
+	struct completion	done;
+	struct kiocb		iocb;
+	struct iov_iter		iter;
 	size_t			count;
+	u64			start_ns;
 	u64			prepare_ns;
+	u64			submit_ns;
 	u64			dio_ns;
 	ssize_t			ret;
+	bool			caller_complete;
 };
 
 static void
-xfs_file_wicache_dio_work(
-	struct work_struct	*work)
+xfs_file_wicache_dio_complete(
+	struct kiocb		*iocb,
+	long			ret)
 {
-	struct xfs_file_wicache_dio_work *dio = container_of(work,
-			struct xfs_file_wicache_dio_work, work);
+	struct xfs_file_wicache_async_dio *dio = container_of(iocb,
+			struct xfs_file_wicache_async_dio, iocb);
 
-	dio->ret = xfs_wicache_dio_write_bvecs_timed(dio->file, dio->pos,
-			dio->bvec, dio->count >> PAGE_SHIFT,
-			dio->count, &dio->dio_ns);
+	if (iocb->dio_complete)
+		dio->caller_complete = true;
+	else {
+		dio->ret = ret;
+		dio->dio_ns = ktime_get_ns() - dio->start_ns;
+	}
+	complete(&dio->done);
+}
+
+static void
+xfs_file_wicache_dio_submit(
+	struct xfs_file_wicache_async_dio *dio,
+	struct file		*file,
+	struct bio_vec		*bvec,
+	loff_t			pos,
+	size_t			count,
+	u64			prepare_ns)
+{
+	ssize_t			ret;
+
+	reinit_completion(&dio->done);
+	init_sync_kiocb(&dio->iocb, file);
+	dio->iocb.ki_complete = xfs_file_wicache_dio_complete;
+	dio->iocb.ki_flags |= IOCB_DIRECT | IOCB_DIO_CALLER_COMP;
+	dio->iocb.ki_pos = pos;
+	iov_iter_bvec(&dio->iter, ITER_SOURCE, bvec,
+			count >> PAGE_SHIFT, count);
+	dio->count = count;
+	dio->prepare_ns = prepare_ns;
+	dio->submit_ns = 0;
+	dio->dio_ns = 0;
+	dio->ret = 0;
+	dio->caller_complete = false;
+	dio->start_ns = ktime_get_ns();
+	ret = xfs_file_dio_write(&dio->iocb, &dio->iter);
+	dio->submit_ns = ktime_get_ns() - dio->start_ns;
+	if (ret != -EIOCBQUEUED)
+		xfs_file_wicache_dio_complete(&dio->iocb, ret);
 }
 
 static ssize_t
-xfs_file_wicache_dio_work_finish(
+xfs_file_wicache_dio_finish(
 	struct kiocb		*iocb,
 	struct iov_iter		*from,
-	struct xfs_file_wicache_dio_work *dio)
+	struct xfs_file_wicache_async_dio *dio)
 {
-	flush_work(&dio->work);
+	u64			wait_start = ktime_get_ns();
+	u64			wait_ns;
+
+	wait_for_completion(&dio->done);
+	if (dio->caller_complete)
+		dio->ret = dio->iocb.dio_complete(dio->iocb.private);
+	dio->dio_ns = ktime_get_ns() - dio->start_ns;
+	wait_ns = ktime_get_ns() - wait_start;
 	xfs_wicache_record_middle_staged(dio->count, dio->dio_ns);
 	xfs_wicache_record_middle_dio(dio->count, dio->prepare_ns, 0,
 			dio->dio_ns, 0);
+	xfs_wicache_record_middle_async(dio->submit_ns, wait_ns);
 	if (dio->ret > 0) {
 		iov_iter_advance(from, dio->ret);
 		iocb->ki_pos += dio->ret;
@@ -1186,7 +1233,7 @@ xfs_file_wicache_dio_pipeline(
 {
 	struct xfs_inode	*ip = XFS_I(file_inode(iocb->ki_filp));
 	struct xfs_wicache_mount *wm = ip->i_mount->m_wicache;
-	struct xfs_file_wicache_dio_work dio;
+	struct xfs_file_wicache_async_dio dio;
 	struct xfs_wicache_dio_slot *slot;
 	struct iov_iter		copy_iter = *from;
 	size_t			submitted = 0;
@@ -1195,13 +1242,13 @@ xfs_file_wicache_dio_pipeline(
 	bool			active = false;
 	u64			start;
 
-	INIT_WORK(&dio.work, xfs_file_wicache_dio_work);
+	init_completion(&dio.done);
 	start = ktime_get_ns();
 	slot = xfs_wicache_dio_slot_get(wm);
 	if (IS_ERR(slot))
 		return PTR_ERR(slot);
 	while (submitted < count) {
-		/* Alternate two regions while the worker owns the active one. */
+		/* Alternate two regions while the device owns the active one. */
 		size_t chunk = min_t(size_t, count - submitted,
 				XFS_WICACHE_PIPE_CHUNK);
 		size_t region = (submitted / XFS_WICACHE_PIPE_CHUNK) & 1;
@@ -1222,7 +1269,7 @@ xfs_file_wicache_dio_pipeline(
 		prepare_ns = ktime_get_ns() - start;
 
 		if (active) {
-			ret = xfs_file_wicache_dio_work_finish(iocb, from,
+			ret = xfs_file_wicache_dio_finish(iocb, from,
 					&dio);
 			active = false;
 			if (ret > 0)
@@ -1233,18 +1280,10 @@ xfs_file_wicache_dio_pipeline(
 			}
 		}
 
-		dio.file = iocb->ki_filp;
-		dio.bvec = slot->bvec +
-				region * (XFS_WICACHE_PIPE_CHUNK >> PAGE_SHIFT);
-		dio.pos = iocb->ki_pos;
-		dio.count = chunk;
-		dio.prepare_ns = prepare_ns;
-		dio.dio_ns = 0;
-		dio.ret = 0;
-		if (!queue_work(wm->io_wq, &dio.work)) {
-			error = -EIO;
-			goto out_put;
-		}
+		xfs_file_wicache_dio_submit(&dio, iocb->ki_filp,
+				slot->bvec + region *
+				(XFS_WICACHE_PIPE_CHUNK >> PAGE_SHIFT),
+				iocb->ki_pos, chunk, prepare_ns);
 		active = true;
 		submitted += chunk;
 		start = ktime_get_ns();
@@ -1252,7 +1291,7 @@ xfs_file_wicache_dio_pipeline(
 
 out_finish:
 	if (active) {
-		ssize_t finish_ret = xfs_file_wicache_dio_work_finish(iocb,
+		ssize_t finish_ret = xfs_file_wicache_dio_finish(iocb,
 				from, &dio);
 
 		if (finish_ret > 0)
@@ -1336,8 +1375,8 @@ xfs_file_wicache_dio_part(
 	size_t			done = 0;
 	ssize_t			ret;
 
-	/* Two or more copy/DIO overlap windows are needed to amortize dispatch. */
-	if (count > 2 * XFS_WICACHE_PIPE_CHUNK &&
+	/* A second chunk is enough to overlap its copy with the first DIO. */
+	if (count > XFS_WICACHE_PIPE_CHUNK &&
 	    (!xfs_wicache_user_dio_enabled() ||
 	     !xfs_file_wicache_user_dio_aligned(iocb, from, count)))
 		return xfs_file_wicache_dio_pipeline(iocb, from, count);

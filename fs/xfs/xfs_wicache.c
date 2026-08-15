@@ -87,6 +87,8 @@ static atomic64_t xfs_wicache_global_middle_direct_dio_ns;
 static atomic64_t xfs_wicache_global_middle_staged_calls;
 static atomic64_t xfs_wicache_global_middle_staged_bytes;
 static atomic64_t xfs_wicache_global_middle_staged_dio_ns;
+static atomic64_t xfs_wicache_global_middle_async_submit_ns;
+static atomic64_t xfs_wicache_global_middle_async_wait_ns;
 static atomic64_t xfs_wicache_global_fragment_calls;
 static atomic64_t xfs_wicache_global_fragment_bytes;
 static atomic64_t xfs_wicache_global_fragment_ns;
@@ -245,6 +247,10 @@ module_param_cb(wicache_middle_staged_bytes, &xfs_wicache_atomic64_ops,
 		&xfs_wicache_global_middle_staged_bytes, 0444);
 module_param_cb(wicache_middle_staged_dio_ns, &xfs_wicache_atomic64_ops,
 		&xfs_wicache_global_middle_staged_dio_ns, 0444);
+module_param_cb(wicache_middle_async_submit_ns, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_middle_async_submit_ns, 0444);
+module_param_cb(wicache_middle_async_wait_ns, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_middle_async_wait_ns, 0444);
 module_param_cb(wicache_fragment_calls, &xfs_wicache_atomic64_ops,
 		&xfs_wicache_global_fragment_calls, 0444);
 module_param_cb(wicache_fragment_bytes, &xfs_wicache_atomic64_ops,
@@ -312,6 +318,15 @@ xfs_wicache_record_middle_staged(
 	atomic64_inc(&xfs_wicache_global_middle_staged_calls);
 	atomic64_add(bytes, &xfs_wicache_global_middle_staged_bytes);
 	atomic64_add(dio_ns, &xfs_wicache_global_middle_staged_dio_ns);
+}
+
+void
+xfs_wicache_record_middle_async(
+	u64			submit_ns,
+	u64			wait_ns)
+{
+	atomic64_add(submit_ns, &xfs_wicache_global_middle_async_submit_ns);
+	atomic64_add(wait_ns, &xfs_wicache_global_middle_async_wait_ns);
 }
 
 void
@@ -877,6 +892,8 @@ xfs_wicache_reset_stats(void)
 	atomic64_set(&xfs_wicache_global_middle_staged_calls, 0);
 	atomic64_set(&xfs_wicache_global_middle_staged_bytes, 0);
 	atomic64_set(&xfs_wicache_global_middle_staged_dio_ns, 0);
+	atomic64_set(&xfs_wicache_global_middle_async_submit_ns, 0);
+	atomic64_set(&xfs_wicache_global_middle_async_wait_ns, 0);
 	atomic64_set(&xfs_wicache_global_fragment_calls, 0);
 	atomic64_set(&xfs_wicache_global_fragment_bytes, 0);
 	atomic64_set(&xfs_wicache_global_fragment_ns, 0);

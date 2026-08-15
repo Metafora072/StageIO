@@ -35,7 +35,7 @@ struct xfs_inode;
 #define XFS_WICACHE_FULL_MASK		((1UL << XFS_WICACHE_NR_SEGS) - 1)
 #define XFS_WICACHE_ACCOUNT_GFP(gfp)	((gfp) | __GFP_ACCOUNT)
 #define XFS_WICACHE_DIO_CHUNK		(4UL << 20)
-#define XFS_WICACHE_DIO_SLOT_SIZE	(2UL << 20)
+#define XFS_WICACHE_DIO_SLOT_SIZE	(4UL << 20)
 #define XFS_WICACHE_DIO_SLOTS		2
 #define XFS_WICACHE_DIO_SLOT_PAGES	(XFS_WICACHE_DIO_SLOT_SIZE / PAGE_SIZE)
 #define XFS_WICACHE_XA_DIRTY		XA_MARK_0
@@ -160,6 +160,7 @@ void xfs_wicache_record_middle_dio(size_t bytes, u64 prepare_ns,
 void xfs_wicache_record_middle_copy(size_t bytes, u64 copy_ns);
 void xfs_wicache_record_middle_direct(size_t bytes, u64 dio_ns);
 void xfs_wicache_record_middle_staged(size_t bytes, u64 dio_ns);
+void xfs_wicache_record_middle_async(u64 submit_ns, u64 wait_ns);
 void xfs_wicache_record_fragment(size_t bytes, u64 ns);
 void xfs_wicache_record_small_write(size_t bytes, u64 ns);
 struct xfs_wicache_dio_slot *xfs_wicache_dio_slot_get(
