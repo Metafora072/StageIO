@@ -93,10 +93,6 @@ static atomic64_t xfs_wicache_global_fragment_ns;
 static atomic64_t xfs_wicache_global_small_write_calls;
 static atomic64_t xfs_wicache_global_small_write_bytes;
 static atomic64_t xfs_wicache_global_small_write_ns;
-static atomic64_t xfs_wicache_global_stage_batch_calls;
-static atomic64_t xfs_wicache_global_stage_alloc_ns;
-static atomic64_t xfs_wicache_global_stage_copy_ns;
-static atomic64_t xfs_wicache_global_stage_store_ns;
 static atomic64_t xfs_wicache_global_dio_pool_bytes;
 static atomic64_t xfs_wicache_global_dio_pool_wait_calls;
 static atomic64_t xfs_wicache_global_dio_pool_wait_ns;
@@ -261,14 +257,6 @@ module_param_cb(wicache_small_write_bytes, &xfs_wicache_atomic64_ops,
 		&xfs_wicache_global_small_write_bytes, 0444);
 module_param_cb(wicache_small_write_ns, &xfs_wicache_atomic64_ops,
 		&xfs_wicache_global_small_write_ns, 0444);
-module_param_cb(wicache_stage_batch_calls, &xfs_wicache_atomic64_ops,
-		&xfs_wicache_global_stage_batch_calls, 0444);
-module_param_cb(wicache_stage_alloc_ns, &xfs_wicache_atomic64_ops,
-		&xfs_wicache_global_stage_alloc_ns, 0444);
-module_param_cb(wicache_stage_copy_ns, &xfs_wicache_atomic64_ops,
-		&xfs_wicache_global_stage_copy_ns, 0444);
-module_param_cb(wicache_stage_store_ns, &xfs_wicache_atomic64_ops,
-		&xfs_wicache_global_stage_store_ns, 0444);
 module_param_cb(wicache_dio_pool_bytes, &xfs_wicache_atomic64_ops,
 		&xfs_wicache_global_dio_pool_bytes, 0444);
 module_param_cb(wicache_dio_pool_wait_calls, &xfs_wicache_atomic64_ops,
@@ -895,10 +883,6 @@ xfs_wicache_reset_stats(void)
 	atomic64_set(&xfs_wicache_global_small_write_calls, 0);
 	atomic64_set(&xfs_wicache_global_small_write_bytes, 0);
 	atomic64_set(&xfs_wicache_global_small_write_ns, 0);
-	atomic64_set(&xfs_wicache_global_stage_batch_calls, 0);
-	atomic64_set(&xfs_wicache_global_stage_alloc_ns, 0);
-	atomic64_set(&xfs_wicache_global_stage_copy_ns, 0);
-	atomic64_set(&xfs_wicache_global_stage_store_ns, 0);
 	atomic64_set(&xfs_wicache_global_dio_pool_wait_calls, 0);
 	atomic64_set(&xfs_wicache_global_dio_pool_wait_ns, 0);
 	atomic64_set(&xfs_wicache_global_inode_records, 0);
@@ -1656,23 +1640,18 @@ xfs_wicache_stage_raw_run(
 				XFS_WICACHE_STAGE_BATCH_PAGES);
 		unsigned int allocated, stored = 0;
 		struct iov_iter iter = *from;
-		u64 start;
 		unsigned int i;
 
 		memset(pages, 0, sizeof(pages));
-		start = ktime_get_ns();
 		error = xfs_wicache_charge(wm, nr * PAGE_SIZE, true);
 		if (error)
 			break;
 		allocated = xfs_wicache_alloc_stage_pages(nr, pages);
-		atomic64_add(ktime_get_ns() - start,
-				&xfs_wicache_global_stage_alloc_ns);
 		if (allocated != nr) {
 			error = -ENOMEM;
 			goto out_release;
 		}
 
-		start = ktime_get_ns();
 		for (i = 0; i < nr; i++) {
 			struct folio *folio = page_folio(pages[i]);
 			void *addr = kmap_local_folio(folio, 0);
@@ -1683,12 +1662,9 @@ xfs_wicache_stage_raw_run(
 			if (error)
 				break;
 		}
-		atomic64_add(ktime_get_ns() - start,
-				&xfs_wicache_global_stage_copy_ns);
 		if (error)
 			goto out_release;
 
-		start = ktime_get_ns();
 		for (i = 0; i < nr; i++) {
 			struct folio *folio = page_folio(pages[i]);
 
@@ -1701,9 +1677,6 @@ xfs_wicache_stage_raw_run(
 			pages[i] = NULL;
 			stored++;
 		}
-		atomic64_add(ktime_get_ns() - start,
-				&xfs_wicache_global_stage_store_ns);
-		atomic64_inc(&xfs_wicache_global_stage_batch_calls);
 
 out_release:
 		for (i = stored; i < allocated; i++) {
