@@ -151,8 +151,26 @@ xfs_file_fsync(
 	struct xfs_mount	*mp = ip->i_mount;
 	int			error, err2;
 	int			log_flushed = 0;
+#ifdef USE_WICACHE
+	struct xfs_wicache_mount *wm = mp->m_wicache;
+	struct xfs_wicache_inode *wi;
+	struct mutex		*admission;
+#endif
 
 	trace_xfs_file_fsync(ip);
+
+#ifdef USE_WICACHE
+	if (wm && wm->enabled) {
+		admission = xfs_wicache_admission_lock(wm, ip);
+		mutex_lock(admission);
+		wi = xfs_wicache_inode_lookup(wm, ip);
+		error = wi ? xfs_wicache_inode_drain(wi) : 0;
+		xfs_wicache_inode_put(wi);
+		mutex_unlock(admission);
+		if (error)
+			return error;
+	}
+#endif
 
 	error = file_write_and_wait_range(file, start, end);
 	if (error)
@@ -1433,7 +1451,7 @@ xfs_file_wicache_write(
 	    xfs_is_cow_inode(ip) ||
 	    (!aligned && pos + count > i_size_read(inode))) {
 		if (has_entry) {
-			ret = xfs_wicache_inode_drain(wi);
+			ret = xfs_wicache_range_drain(wi, pos, count);
 			if (ret)
 				goto out_admission;
 		}
@@ -1447,7 +1465,7 @@ xfs_file_wicache_write(
 	/* Keep complete-page writes out of the dirty page cache. */
 	if (aligned && !small_write) {
 		if (has_entry) {
-			ret = xfs_wicache_inode_drain(wi);
+			ret = xfs_wicache_range_drain(wi, pos, count);
 			if (ret)
 				goto out_admission;
 		}
@@ -1460,7 +1478,7 @@ xfs_file_wicache_write(
 	}
 	if (has_entry && !small_write &&
 	    offset_in_page(pos) + count > PAGE_SIZE) {
-		ret = xfs_wicache_inode_drain(wi);
+		ret = xfs_wicache_range_drain(wi, pos, count);
 		if (ret)
 			goto out_admission;
 		has_entry = false;

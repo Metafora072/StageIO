@@ -99,6 +99,11 @@ struct xfs_wicache_inode {
 	atomic_t			batch_active;
 	enum xfs_wicache_inode_state	state;
 
+	struct mutex			drain_mutex;
+	spinlock_t			drain_lock;
+	bool				drain_range_active;
+	pgoff_t			drain_first;
+	pgoff_t			drain_last;
 	struct rw_semaphore		visibility_sem;
 	struct delayed_work		flush_work;
 	refcount_t			refcount;
@@ -147,6 +152,8 @@ int xfs_wicache_overlay_iter(struct xfs_wicache_inode *wi,
 		struct iov_iter *to, loff_t pos, size_t count);
 bool xfs_wicache_inode_has_dirty(struct xfs_wicache_inode *wi);
 int xfs_wicache_inode_drain(struct xfs_wicache_inode *wi);
+int xfs_wicache_range_drain(struct xfs_wicache_inode *wi,
+		loff_t pos, size_t count);
 bool xfs_wicache_range_has_entry(struct xfs_wicache_inode *wi,
 		loff_t pos, size_t count);
 void xfs_wicache_read_lock(struct xfs_wicache_inode *wi);

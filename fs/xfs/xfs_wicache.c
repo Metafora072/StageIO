@@ -100,6 +100,10 @@ static atomic64_t xfs_wicache_global_dio_pool_wait_calls;
 static atomic64_t xfs_wicache_global_dio_pool_wait_ns;
 static atomic64_t xfs_wicache_global_inode_records;
 static atomic64_t xfs_wicache_global_inode_records_peak;
+static atomic64_t xfs_wicache_global_range_drain_calls;
+static atomic64_t xfs_wicache_global_range_drain_entries;
+static atomic64_t xfs_wicache_global_range_drain_ns;
+static atomic64_t xfs_wicache_global_range_drain_max_ns;
 
 module_param_named(wicache_enable, xfs_wicache_enable, bool, 0444);
 MODULE_PARM_DESC(wicache_enable, "Enable experimental sparse write overlay");
@@ -273,6 +277,14 @@ module_param_cb(wicache_inode_records, &xfs_wicache_atomic64_ops,
 		&xfs_wicache_global_inode_records, 0444);
 module_param_cb(wicache_inode_records_peak, &xfs_wicache_atomic64_ops,
 		&xfs_wicache_global_inode_records_peak, 0444);
+module_param_cb(wicache_range_drain_calls, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_range_drain_calls, 0444);
+module_param_cb(wicache_range_drain_entries, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_range_drain_entries, 0444);
+module_param_cb(wicache_range_drain_ns, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_range_drain_ns, 0444);
+module_param_cb(wicache_range_drain_max_ns, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_range_drain_max_ns, 0444);
 
 void
 xfs_wicache_record_middle_dio(
@@ -789,6 +801,8 @@ xfs_wicache_inode_alloc(
 	atomic64_set(&wi->seq, 0);
 	atomic_set(&wi->batch_active, 0);
 	wi->state = XFS_WICACHE_INODE_ACTIVE;
+	mutex_init(&wi->drain_mutex);
+	spin_lock_init(&wi->drain_lock);
 	init_rwsem(&wi->visibility_sem);
 	INIT_DELAYED_WORK(&wi->flush_work, xfs_wicache_inode_flush_work);
 	INIT_LIST_HEAD(&wi->mount_node);
@@ -904,6 +918,10 @@ xfs_wicache_reset_stats(void)
 	atomic64_set(&xfs_wicache_global_dio_pool_wait_ns, 0);
 	atomic64_set(&xfs_wicache_global_inode_records, 0);
 	atomic64_set(&xfs_wicache_global_inode_records_peak, 0);
+	atomic64_set(&xfs_wicache_global_range_drain_calls, 0);
+	atomic64_set(&xfs_wicache_global_range_drain_entries, 0);
+	atomic64_set(&xfs_wicache_global_range_drain_ns, 0);
+	atomic64_set(&xfs_wicache_global_range_drain_max_ns, 0);
 }
 
 static void
@@ -2048,15 +2066,130 @@ xfs_wicache_inode_has_dirty(
 	return atomic64_read(&wi->nr_entries) != 0;
 }
 
+static bool
+xfs_wicache_index_range_has_entry(
+	struct xfs_wicache_inode *wi,
+	pgoff_t		first,
+	pgoff_t		last)
+{
+	unsigned long		index = first;
+	bool			found;
+
+	rcu_read_lock();
+	found = xa_find(&wi->entries, &index, last, XA_PRESENT) != NULL;
+	rcu_read_unlock();
+	return found;
+}
+
+static unsigned long
+xfs_wicache_index_range_entries(
+	struct xfs_wicache_inode *wi,
+	pgoff_t		first,
+	pgoff_t		last)
+{
+	unsigned long		index = first;
+	unsigned long		nr = 0;
+
+	rcu_read_lock();
+	while (xa_find(&wi->entries, &index, last, XA_PRESENT)) {
+		nr++;
+		if (index == last)
+			break;
+		index++;
+	}
+	rcu_read_unlock();
+	return nr;
+}
+
+static void
+xfs_wicache_record_range_drain(
+	unsigned long		entries,
+	u64			ns)
+{
+	s64			old;
+
+	atomic64_inc(&xfs_wicache_global_range_drain_calls);
+	atomic64_add(entries, &xfs_wicache_global_range_drain_entries);
+	atomic64_add(ns, &xfs_wicache_global_range_drain_ns);
+	old = atomic64_read(&xfs_wicache_global_range_drain_max_ns);
+	while (ns > old) {
+		s64 seen = atomic64_cmpxchg(
+				&xfs_wicache_global_range_drain_max_ns, old, ns);
+
+		if (seen == old)
+			break;
+		old = seen;
+	}
+}
+
+static int
+xfs_wicache_index_range_drain(
+	struct xfs_wicache_inode *wi,
+	pgoff_t		first,
+	pgoff_t		last,
+	bool			account)
+{
+	unsigned long		entries;
+	u64			start;
+	int			ret;
+
+	if (!xfs_wicache_index_range_has_entry(wi, first, last))
+		return 0;
+
+	mutex_lock(&wi->drain_mutex);
+	entries = xfs_wicache_index_range_entries(wi, first, last);
+	if (!entries) {
+		mutex_unlock(&wi->drain_mutex);
+		return 0;
+	}
+	start = ktime_get_ns();
+	spin_lock(&wi->drain_lock);
+	wi->drain_first = first;
+	wi->drain_last = last;
+	wi->drain_range_active = true;
+	spin_unlock(&wi->drain_lock);
+
+	mod_delayed_work(wi->wm->control_wq, &wi->flush_work, 0);
+	ret = wait_event_killable(wi->wm->dirty_wait,
+			!xfs_wicache_index_range_has_entry(wi, first, last));
+
+	spin_lock(&wi->drain_lock);
+	wi->drain_range_active = false;
+	spin_unlock(&wi->drain_lock);
+	if (atomic64_read(&wi->nr_entries))
+		xfs_wicache_kick_inode(wi,
+				msecs_to_jiffies(xfs_wicache_delay_ms));
+	mutex_unlock(&wi->drain_mutex);
+
+	if (account)
+		xfs_wicache_record_range_drain(entries,
+				ktime_get_ns() - start);
+	return ret;
+}
+
 int
 xfs_wicache_inode_drain(
 	struct xfs_wicache_inode *wi)
 {
 	if (!xfs_wicache_inode_has_dirty(wi))
 		return 0;
-	mod_delayed_work(wi->wm->control_wq, &wi->flush_work, 0);
-	return wait_event_killable(wi->wm->dirty_wait,
-			!xfs_wicache_inode_has_dirty(wi));
+	return xfs_wicache_index_range_drain(wi, 0, ULONG_MAX, false);
+}
+
+int
+xfs_wicache_range_drain(
+	struct xfs_wicache_inode *wi,
+	loff_t			pos,
+	size_t			count)
+{
+	pgoff_t		first;
+	pgoff_t		last;
+
+	if (!count)
+		return 0;
+	first = pos >> PAGE_SHIFT;
+	last = (pos + count - 1) >> PAGE_SHIFT;
+	return xfs_wicache_index_range_drain(wi, first, last, true);
 }
 
 bool
@@ -2065,20 +2198,14 @@ xfs_wicache_range_has_entry(
 	loff_t			pos,
 	size_t			count)
 {
-	pgoff_t			first = pos >> PAGE_SHIFT;
-	pgoff_t			last = (pos + count - 1) >> PAGE_SHIFT;
-	pgoff_t			index;
+	pgoff_t			first;
+	pgoff_t			last;
 
-	for (index = first; index <= last; index++) {
-		bool			found;
-
-		rcu_read_lock();
-		found = xa_load(&wi->entries, index) != NULL;
-		rcu_read_unlock();
-		if (found)
-			return true;
-	}
-	return false;
+	if (!count)
+		return false;
+	first = pos >> PAGE_SHIFT;
+	last = (pos + count - 1) >> PAGE_SHIFT;
+	return xfs_wicache_index_range_has_entry(wi, first, last);
 }
 
 void
@@ -2744,12 +2871,31 @@ enum xfs_wicache_raw_queue_result {
 	XFS_WICACHE_RAW_BUSY,
 };
 
+static void
+xfs_wicache_flush_bounds(
+	struct xfs_wicache_inode *wi,
+	pgoff_t		*first,
+	pgoff_t		*last)
+{
+	spin_lock(&wi->drain_lock);
+	if (wi->drain_range_active) {
+		*first = wi->drain_first;
+		*last = wi->drain_last;
+	} else {
+		*first = 0;
+		*last = ULONG_MAX;
+	}
+	spin_unlock(&wi->drain_lock);
+}
+
 static enum xfs_wicache_raw_queue_result
 xfs_wicache_queue_raw_batch(
-	struct xfs_wicache_inode *wi)
+	struct xfs_wicache_inode *wi,
+	pgoff_t		first,
+	pgoff_t		last)
 {
 	struct xfs_wicache_raw_batch *batch;
-	XA_STATE(xas, &wi->entries, 0);
+	XA_STATE(xas, &wi->entries, first);
 	struct folio		*folio;
 	unsigned int		queued = 0;
 	int			active;
@@ -2776,7 +2922,7 @@ xfs_wicache_queue_raw_batch(
 	}
 
 	xas_lock(&xas);
-	xas_for_each_marked(&xas, folio, ULONG_MAX,
+	xas_for_each_marked(&xas, folio, last,
 			XFS_WICACHE_XA_DIRTY) {
 		if (!xas_get_mark(&xas, XFS_WICACHE_XA_FULL))
 			continue;
@@ -2816,14 +2962,15 @@ xfs_wicache_inode_flush_work(
 			struct xfs_wicache_inode, flush_work);
 	struct xfs_wicache_batch *batch;
 	struct xfs_wicache_entry *entry;
-	XA_STATE(xas, &wi->entries, 0);
+	pgoff_t		first, last;
 	unsigned int		queued = 0, i;
 	u64			scan_start;
 	int			active;
 	bool			more_dirty;
 	enum xfs_wicache_raw_queue_result raw_result;
 
-	raw_result = xfs_wicache_queue_raw_batch(wi);
+	xfs_wicache_flush_bounds(wi, &first, &last);
+	raw_result = xfs_wicache_queue_raw_batch(wi, first, last);
 	if (raw_result != XFS_WICACHE_RAW_NONE)
 		return;
 
@@ -2842,17 +2989,21 @@ xfs_wicache_inode_flush_work(
 
 	scan_start = ktime_get_ns();
 	xa_lock(&wi->entries);
-	xas_for_each_marked(&xas, entry, ULONG_MAX,
-			XFS_WICACHE_XA_DIRTY) {
-		if (xas_get_mark(&xas, XFS_WICACHE_XA_FULL))
-			continue;
-		if (WARN_ON_ONCE(!xfs_wicache_entry_get(entry)))
-			break;
-		xas_clear_mark(&xas, XFS_WICACHE_XA_DIRTY);
-		entry->queued = true;
-		batch->entries[queued++] = entry;
-		if (queued == xfs_wicache_batch)
-			break;
+	{
+		XA_STATE(xas, &wi->entries, first);
+
+		xas_for_each_marked(&xas, entry, last,
+				XFS_WICACHE_XA_DIRTY) {
+			if (xas_get_mark(&xas, XFS_WICACHE_XA_FULL))
+				continue;
+			if (WARN_ON_ONCE(!xfs_wicache_entry_get(entry)))
+				break;
+			xas_clear_mark(&xas, XFS_WICACHE_XA_DIRTY);
+			entry->queued = true;
+			batch->entries[queued++] = entry;
+			if (queued == xfs_wicache_batch)
+				break;
+		}
 	}
 	more_dirty = xa_marked(&wi->entries, XFS_WICACHE_XA_DIRTY);
 	xa_unlock(&wi->entries);
