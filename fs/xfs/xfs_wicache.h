@@ -96,6 +96,7 @@ struct xfs_wicache_inode {
 	atomic64_t			dirty_bytes;
 	atomic64_t			nr_entries;
 	atomic64_t			seq;
+	atomic_t			staging;
 	atomic_t			batch_active;
 	enum xfs_wicache_inode_state	state;
 
@@ -156,18 +157,25 @@ int xfs_wicache_range_drain(struct xfs_wicache_inode *wi,
 		loff_t pos, size_t count);
 bool xfs_wicache_range_has_entry(struct xfs_wicache_inode *wi,
 		loff_t pos, size_t count);
+bool xfs_wicache_range_has_large_folio(struct xfs_wicache_inode *wi,
+		loff_t pos, size_t count);
 void xfs_wicache_read_lock(struct xfs_wicache_inode *wi);
 void xfs_wicache_read_unlock(struct xfs_wicache_inode *wi);
 void xfs_wicache_record_front_iolock(u64 ns);
 void xfs_wicache_record_mapping_check(u64 ns);
 unsigned long xfs_wicache_io_unit_bytes(void);
 bool xfs_wicache_user_dio_enabled(void);
+bool xfs_wicache_clean_handoff_enabled(void);
+bool xfs_wicache_clean_handoff_async_enabled(void);
+bool xfs_wicache_clean_handoff_writebehind_enabled(void);
 void xfs_wicache_record_middle_dio(size_t bytes, u64 prepare_ns,
 		u64 bvec_ns, u64 dio_ns, u64 release_ns);
 void xfs_wicache_record_middle_copy(size_t bytes, u64 copy_ns);
 void xfs_wicache_record_middle_direct(size_t bytes, u64 dio_ns);
 void xfs_wicache_record_middle_staged(size_t bytes, u64 dio_ns);
 void xfs_wicache_record_middle_async(u64 submit_ns, u64 wait_ns);
+void xfs_wicache_record_clean_handoff(size_t bytes, unsigned int cached,
+		unsigned int conflicts, u64 ns);
 void xfs_wicache_record_fragment(size_t bytes, u64 ns);
 void xfs_wicache_record_small_write(size_t bytes, u64 ns);
 struct xfs_wicache_dio_slot *xfs_wicache_dio_slot_get(
