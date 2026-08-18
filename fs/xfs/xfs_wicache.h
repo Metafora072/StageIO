@@ -42,6 +42,7 @@ struct xfs_inode;
 #define XFS_WICACHE_XA_FULL		XA_MARK_1
 #define XFS_WICACHE_XA_FLUSHING		XA_MARK_2
 #define XFS_WICACHE_SMALL_WRITE_MAX	(1UL << 20)
+#define XFS_WICACHE_HANDOFF_WORKERS	8
 
 enum xfs_wicache_entry_state {
 	XFS_WICACHE_ENTRY_DIRTY = 0,
@@ -106,6 +107,8 @@ struct xfs_wicache_inode {
 	pgoff_t			drain_first;
 	pgoff_t			drain_last;
 	struct rw_semaphore		visibility_sem;
+	struct list_head		clean_batches;
+	atomic64_t			clean_bytes;
 	struct delayed_work		flush_work;
 	refcount_t			refcount;
 	struct rcu_head			rcu;
@@ -124,8 +127,15 @@ struct xfs_wicache_mount {
 	struct list_head		inodes;
 	struct workqueue_struct		*control_wq;
 	struct workqueue_struct		*io_wq;
+	struct workqueue_struct		*handoff_wq;
 	atomic64_t			total_dirty_bytes;
 	wait_queue_head_t		dirty_wait;
+	struct mutex			clean_lock;
+	struct list_head		clean_batches;
+	atomic64_t			clean_bytes;
+	spinlock_t			reuse_lock;
+	struct list_head		reuse_folios;
+	unsigned long			reuse_bytes;
 	spinlock_t			dio_slot_lock;
 	struct list_head		dio_free_slots;
 	wait_queue_head_t		dio_slot_wait;
@@ -150,6 +160,8 @@ ssize_t xfs_wicache_stage_iter(struct xfs_wicache_inode *wi,
 		struct file *file, struct iov_iter *from, loff_t pos,
 		size_t count);
 int xfs_wicache_overlay_iter(struct xfs_wicache_inode *wi,
+		struct iov_iter *to, loff_t pos, size_t count);
+ssize_t xfs_wicache_read_clean_iter(struct xfs_wicache_inode *wi,
 		struct iov_iter *to, loff_t pos, size_t count);
 bool xfs_wicache_inode_has_dirty(struct xfs_wicache_inode *wi);
 int xfs_wicache_inode_drain(struct xfs_wicache_inode *wi);

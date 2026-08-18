@@ -336,6 +336,7 @@ xfs_file_wicache_read(
 	struct iov_iter		overlay = *to;
 	loff_t			pos = iocb->ki_pos;
 	ssize_t			ret;
+	bool			clean_direct = false;
 
 	if (!wm || !wm->enabled)
 		return -EOPNOTSUPP;
@@ -348,9 +349,22 @@ xfs_file_wicache_read(
 	xfs_wicache_read_lock(wi);
 	ret = xfs_ilock_iocb(iocb, XFS_IOLOCK_SHARED);
 	if (!ret) {
-		ret = generic_file_read_iter(iocb, to);
+		loff_t isize = i_size_read(inode);
+		size_t clean_count = 0;
+
+		if (pos < isize)
+			clean_count = min_t(loff_t, iov_iter_count(to),
+					isize - pos);
+		ret = xfs_wicache_read_clean_iter(wi, to, pos, clean_count);
+		if (ret >= 0) {
+			iocb->ki_pos = pos + ret;
+			clean_direct = true;
+		} else if (ret == -EOPNOTSUPP) {
+			ret = generic_file_read_iter(iocb, to);
+		}
 		xfs_iunlock(ip, XFS_IOLOCK_SHARED);
-		if (ret > 0 && xfs_wicache_overlay_iter(wi, &overlay,
+		if (!clean_direct && ret > 0 &&
+		    xfs_wicache_overlay_iter(wi, &overlay,
 				pos, ret))
 			ret = -EFAULT;
 	}
