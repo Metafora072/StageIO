@@ -43,6 +43,8 @@ struct xfs_inode;
 #define XFS_WICACHE_XA_FLUSHING		XA_MARK_2
 #define XFS_WICACHE_SMALL_WRITE_MAX	(1UL << 20)
 #define XFS_WICACHE_HANDOFF_WORKERS	8
+#define XFS_WICACHE_MPMC_MIN_SLOTS	256
+#define XFS_WICACHE_MPMC_MAX_WORKERS	64
 
 enum xfs_wicache_entry_state {
 	XFS_WICACHE_ENTRY_DIRTY = 0,
@@ -58,6 +60,8 @@ enum xfs_wicache_inode_state {
 struct xfs_wicache_mount;
 struct xfs_wicache_inode;
 struct xfs_wicache_batch;
+struct xfs_wicache_mpmc_ring;
+struct xfs_wicache_mpmc_worker;
 
 struct xfs_wicache_entry {
 	struct xfs_wicache_inode	*wi;
@@ -82,7 +86,6 @@ struct xfs_wicache_entry {
 
 	refcount_t			refcount;
 	struct mutex			lock;
-	struct work_struct		prepare_work;
 	struct rcu_head			rcu;
 };
 
@@ -126,8 +129,16 @@ struct xfs_wicache_mount {
 	struct mutex			admission_locks[XFS_WICACHE_NR_ADMISSION_LOCKS];
 	struct list_head		inodes;
 	struct workqueue_struct		*control_wq;
-	struct workqueue_struct		*io_wq;
+	struct workqueue_struct		*prepare_wq;
+	struct workqueue_struct		*persist_wq;
 	struct workqueue_struct		*handoff_wq;
+	struct xfs_wicache_mpmc_ring	*prepare_ring;
+	struct xfs_wicache_mpmc_ring	*persist_ring;
+	struct xfs_wicache_mpmc_worker	*prepare_workers;
+	struct xfs_wicache_mpmc_worker	*persist_workers;
+	unsigned int			prepare_worker_count;
+	unsigned int			persist_worker_count;
+	atomic_t			raw_persist_active;
 	atomic64_t			total_dirty_bytes;
 	wait_queue_head_t		dirty_wait;
 	struct mutex			clean_lock;
