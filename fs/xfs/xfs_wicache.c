@@ -36,6 +36,7 @@ static bool xfs_wicache_clean_handoff;
 static bool xfs_wicache_clean_handoff_async;
 static bool xfs_wicache_clean_handoff_writebehind;
 static bool xfs_wicache_clean_recent;
+static bool xfs_wicache_clean_access_aware = true;
 static bool xfs_wicache_clean_reuse = true;
 static unsigned long xfs_wicache_clean_recent_inode_bytes = 32UL << 20;
 static unsigned long xfs_wicache_clean_reuse_bytes = 256UL << 20;
@@ -114,6 +115,11 @@ static atomic64_t xfs_wicache_global_clean_recent_current_bytes;
 static atomic64_t xfs_wicache_global_clean_recent_hit_bytes;
 static atomic64_t xfs_wicache_global_clean_recent_miss_reads;
 static atomic64_t xfs_wicache_global_clean_recent_peak_bytes;
+static atomic64_t xfs_wicache_global_clean_first_accesses;
+static atomic64_t xfs_wicache_global_clean_promotions;
+static atomic64_t xfs_wicache_global_clean_rereferences;
+static atomic64_t xfs_wicache_global_clean_second_chances;
+static atomic64_t xfs_wicache_global_clean_forced_evictions;
 static atomic64_t xfs_wicache_global_clean_reuse_current_bytes;
 static atomic64_t xfs_wicache_global_clean_reused_bytes;
 static atomic64_t xfs_wicache_global_clean_reuse_peak_bytes;
@@ -177,6 +183,10 @@ module_param_named(wicache_clean_recent, xfs_wicache_clean_recent,
 		bool, 0444);
 MODULE_PARM_DESC(wicache_clean_recent,
 		"Retain completed DIO folios in the StageIO XArray");
+module_param_named(wicache_clean_access_aware,
+		xfs_wicache_clean_access_aware, bool, 0444);
+MODULE_PARM_DESC(wicache_clean_access_aware,
+		"Use two-hit admission and protected CLOCK clean retention");
 module_param_named(wicache_clean_reuse, xfs_wicache_clean_reuse,
 		bool, 0444);
 MODULE_PARM_DESC(wicache_clean_reuse,
@@ -388,6 +398,19 @@ module_param_cb(wicache_clean_recent_miss_reads,
 module_param_cb(wicache_clean_recent_peak_bytes,
 		&xfs_wicache_atomic64_ops,
 		&xfs_wicache_global_clean_recent_peak_bytes, 0444);
+module_param_cb(wicache_clean_first_accesses,
+		&xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_clean_first_accesses, 0444);
+module_param_cb(wicache_clean_promotions, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_clean_promotions, 0444);
+module_param_cb(wicache_clean_rereferences, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_clean_rereferences, 0444);
+module_param_cb(wicache_clean_second_chances,
+		&xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_clean_second_chances, 0444);
+module_param_cb(wicache_clean_forced_evictions,
+		&xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_clean_forced_evictions, 0444);
 module_param_cb(wicache_clean_reuse_current_bytes,
 		&xfs_wicache_atomic64_ops,
 		&xfs_wicache_global_clean_reuse_current_bytes, 0444);
@@ -661,9 +684,13 @@ struct xfs_wicache_batch {
 	struct xfs_wicache_entry	*entries[];
 };
 
+struct xfs_wicache_raw_batch;
+
 struct xfs_wicache_raw_item {
 	pgoff_t			page_index;
 	struct folio			*folio;
+	struct xfs_wicache_raw_batch	*batch;
+	atomic_long_t			clean_seen_pages;
 	bool				handoff;
 	bool				clean_recent;
 	bool				clean_removed;
@@ -675,12 +702,75 @@ struct xfs_wicache_raw_batch {
 	struct work_struct		handoff_work;
 	struct list_head		clean_node;
 	struct list_head		clean_inode_node;
+	atomic_t			clean_access_state;
 	struct xfs_wicache_inode	*wi;
 	struct file			*file;
 	unsigned int			nr;
 	size_t				clean_bytes;
 	struct xfs_wicache_raw_item	items[];
 };
+
+enum xfs_wicache_clean_access_state {
+	/* One-hit batches remain probationary; only a second read admits them. */
+	XFS_WICACHE_CLEAN_PROBATION_NEW = 0,
+	XFS_WICACHE_CLEAN_PROBATION_SEEN,
+	XFS_WICACHE_CLEAN_PROTECTED_COLD,
+	XFS_WICACHE_CLEAN_PROTECTED_HOT,
+};
+
+static void
+xfs_wicache_note_clean_access(
+	struct folio		*folio,
+	pgoff_t		page_index)
+{
+	struct xfs_wicache_raw_item *item;
+	struct xfs_wicache_raw_batch *batch;
+	unsigned long		bit, seen;
+	bool			repeated;
+	int			old, new;
+
+	if (!xfs_wicache_clean_access_aware ||
+	    !folio_test_private(folio))
+		return;
+	item = folio_get_private(folio);
+	if (!item || page_index < item->page_index ||
+	    page_index >= item->page_index + folio_nr_pages(folio))
+		return;
+	batch = item->batch;
+	bit = BIT(page_index - item->page_index);
+	seen = atomic_long_fetch_or(bit, &item->clean_seen_pages);
+	repeated = seen & bit;
+
+	old = atomic_read(&batch->clean_access_state);
+	for (;;) {
+		switch (old) {
+		case XFS_WICACHE_CLEAN_PROBATION_NEW:
+			new = repeated ? XFS_WICACHE_CLEAN_PROTECTED_HOT :
+				XFS_WICACHE_CLEAN_PROBATION_SEEN;
+			break;
+		case XFS_WICACHE_CLEAN_PROBATION_SEEN:
+			if (!repeated)
+				return;
+			new = XFS_WICACHE_CLEAN_PROTECTED_HOT;
+			break;
+		case XFS_WICACHE_CLEAN_PROTECTED_COLD:
+			new = XFS_WICACHE_CLEAN_PROTECTED_HOT;
+			break;
+		default:
+			return;
+		}
+		if (atomic_try_cmpxchg(&batch->clean_access_state,
+				&old, new))
+			break;
+	}
+
+	if (old == XFS_WICACHE_CLEAN_PROBATION_NEW && !repeated)
+		atomic64_inc(&xfs_wicache_global_clean_first_accesses);
+	else if (old <= XFS_WICACHE_CLEAN_PROBATION_SEEN)
+		atomic64_inc(&xfs_wicache_global_clean_promotions);
+	else
+		atomic64_inc(&xfs_wicache_global_clean_rereferences);
+}
 
 struct xfs_wicache_mpmc_slot {
 	atomic_long_t			sequence;
@@ -1212,6 +1302,10 @@ xfs_wicache_release_clean_batch(
 
 		if (!item->clean_recent)
 			continue;
+		if (folio_test_private(item->folio)) {
+			WARN_ON_ONCE(folio_get_private(item->folio) != item);
+			folio_detach_private(item->folio);
+		}
 		bytes = folio_size(item->folio);
 		if (item->clean_removed) {
 			atomic64_dec(&wi->nr_entries);
@@ -1297,14 +1391,42 @@ xfs_wicache_take_one_inode_clean(
 {
 	struct xfs_wicache_mount *wm = wi->wm;
 	struct xfs_wicache_raw_batch *batch;
+	s64			scan_budget, scanned = 0;
 
 	mutex_lock(&wm->clean_lock);
 	if (list_empty(&wi->clean_batches)) {
 		mutex_unlock(&wm->clean_lock);
 		return NULL;
 	}
-	batch = list_first_entry(&wi->clean_batches,
-			struct xfs_wicache_raw_batch, clean_inode_node);
+	scan_budget = atomic64_read(&wi->clean_bytes);
+	for (;;) {
+		int state;
+
+		batch = list_first_entry(&wi->clean_batches,
+				struct xfs_wicache_raw_batch,
+				clean_inode_node);
+		if (!xfs_wicache_clean_access_aware)
+			break;
+		if (scanned >= scan_budget) {
+			/* A bounded revolution guarantees progress if all are hot. */
+			atomic64_inc(
+				&xfs_wicache_global_clean_forced_evictions);
+			break;
+		}
+		state = atomic_read(&batch->clean_access_state);
+		if (state != XFS_WICACHE_CLEAN_PROTECTED_HOT)
+			break;
+		if (atomic_cmpxchg(&batch->clean_access_state,
+				XFS_WICACHE_CLEAN_PROTECTED_HOT,
+				XFS_WICACHE_CLEAN_PROTECTED_COLD) !=
+		    XFS_WICACHE_CLEAN_PROTECTED_HOT)
+			continue;
+		list_move_tail(&batch->clean_inode_node,
+				&wi->clean_batches);
+		list_move_tail(&batch->clean_node, &wm->clean_batches);
+		scanned += batch->clean_bytes;
+		atomic64_inc(&xfs_wicache_global_clean_second_chances);
+	}
 	list_del_init(&batch->clean_node);
 	list_del_init(&batch->clean_inode_node);
 	atomic64_sub(batch->clean_bytes, &wm->clean_bytes);
@@ -1978,6 +2100,11 @@ xfs_wicache_reset_stats(void)
 	atomic64_set(&xfs_wicache_global_clean_recent_hit_bytes, 0);
 	atomic64_set(&xfs_wicache_global_clean_recent_miss_reads, 0);
 	atomic64_set(&xfs_wicache_global_clean_recent_peak_bytes, 0);
+	atomic64_set(&xfs_wicache_global_clean_first_accesses, 0);
+	atomic64_set(&xfs_wicache_global_clean_promotions, 0);
+	atomic64_set(&xfs_wicache_global_clean_rereferences, 0);
+	atomic64_set(&xfs_wicache_global_clean_second_chances, 0);
+	atomic64_set(&xfs_wicache_global_clean_forced_evictions, 0);
 	atomic64_set(&xfs_wicache_global_clean_reuse_current_bytes, 0);
 	atomic64_set(&xfs_wicache_global_clean_reused_bytes, 0);
 	atomic64_set(&xfs_wicache_global_clean_reuse_peak_bytes, 0);
@@ -2550,6 +2677,7 @@ xfs_wicache_lookup_clean_full(
 	    !xas_get_mark(&xas, XFS_WICACHE_XA_FLUSHING)) {
 		folio = node;
 		folio_get(folio);
+		xfs_wicache_note_clean_access(folio, page_index);
 	}
 	xas_unlock(&xas);
 	return folio;
@@ -4454,10 +4582,17 @@ xfs_wicache_finish_raw_item(
 	    xas_get_mark(&xas, XFS_WICACHE_XA_FLUSHING)) {
 		if (ret == bytes) {
 			if (xfs_wicache_clean_recent) {
-				xas_clear_mark(&xas,
+				if (WARN_ON_ONCE(
+					    folio_test_private(item->folio))) {
+					xas_store(&xas, NULL);
+					removed = true;
+				} else {
+					folio_attach_private(item->folio, item);
+					xas_clear_mark(&xas,
 						XFS_WICACHE_XA_FLUSHING);
-				item->clean_recent = true;
-				clean_recent = true;
+					item->clean_recent = true;
+					clean_recent = true;
+				}
 			} else if (xfs_wicache_clean_handoff_enabled() &&
 			    xfs_wicache_clean_handoff_async_enabled()) {
 				xas_clear_mark(&xas,
@@ -4738,6 +4873,8 @@ xfs_wicache_queue_raw_batch(
 	batch->wi = wi;
 	INIT_LIST_HEAD(&batch->clean_node);
 	INIT_LIST_HEAD(&batch->clean_inode_node);
+	atomic_set(&batch->clean_access_state,
+			XFS_WICACHE_CLEAN_PROBATION_NEW);
 	batch->file = xfs_wicache_inode_temp_file_get(wi);
 	if (!batch->file) {
 		kfree(batch);
@@ -4760,6 +4897,8 @@ xfs_wicache_queue_raw_batch(
 		xas_set_mark(&xas, XFS_WICACHE_XA_FLUSHING);
 		batch->items[queued].page_index = folio->index;
 		batch->items[queued].folio = folio;
+		batch->items[queued].batch = batch;
+		atomic_long_set(&batch->items[queued].clean_seen_pages, 0);
 		queued++;
 		queued_pages += pages;
 		if (queued_pages >= xfs_wicache_batch)
