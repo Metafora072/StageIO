@@ -41,6 +41,9 @@ struct xfs_inode;
 #define XFS_WICACHE_XA_DIRTY		XA_MARK_0
 #define XFS_WICACHE_XA_FULL		XA_MARK_1
 #define XFS_WICACHE_XA_FLUSHING		XA_MARK_2
+#define XFS_WICACHE_REGION_ORDER	4
+#define XFS_WICACHE_REGION_PAGES	(1U << XFS_WICACHE_REGION_ORDER)
+#define XFS_WICACHE_REGION_MASK		(XFS_WICACHE_REGION_PAGES - 1)
 #define XFS_WICACHE_SMALL_WRITE_MAX	(1UL << 20)
 #define XFS_WICACHE_HANDOFF_WORKERS	8
 #define XFS_WICACHE_MPMC_MIN_SLOTS	256
@@ -89,6 +92,19 @@ struct xfs_wicache_entry {
 	struct rcu_head			rcu;
 };
 
+struct xfs_wicache_region_slots {
+	u16				present;
+	u16				nr;
+	u16				capacity;
+	struct xfs_wicache_entry	*entries[];
+};
+
+struct xfs_wicache_region {
+	refcount_t			refcount;
+	u16				dirty;
+	struct xfs_wicache_region_slots	*slots;
+};
+
 struct xfs_wicache_inode {
 	struct xfs_wicache_mount	*wm;
 	struct xfs_inode		*ip;
@@ -97,6 +113,7 @@ struct xfs_wicache_inode {
 	struct list_head		mount_node;
 
 	struct xarray			entries;
+	struct xarray			regions;
 	atomic64_t			dirty_bytes;
 	atomic64_t			nr_entries;
 	atomic64_t			seq;

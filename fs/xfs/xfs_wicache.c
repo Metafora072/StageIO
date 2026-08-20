@@ -75,6 +75,8 @@ static atomic64_t xfs_wicache_global_dispatch_ns;
 static atomic64_t xfs_wicache_global_finish_ns;
 static atomic64_t xfs_wicache_global_entry_bytes;
 static atomic64_t xfs_wicache_global_entry_peak_bytes;
+static atomic64_t xfs_wicache_global_region_bytes;
+static atomic64_t xfs_wicache_global_region_peak_bytes;
 static atomic64_t xfs_wicache_global_front_iolock_ns;
 static atomic64_t xfs_wicache_global_front_iolock_calls;
 static atomic64_t xfs_wicache_global_front_iolock_max_ns;
@@ -142,6 +144,9 @@ static atomic64_t xfs_wicache_global_prepare_workers_active;
 static atomic64_t xfs_wicache_global_prepare_workers_peak;
 static atomic64_t xfs_wicache_global_persist_workers_active;
 static atomic64_t xfs_wicache_global_persist_workers_peak;
+
+static bool xfs_wicache_region_range_has_entry(
+		struct xfs_wicache_inode *wi, pgoff_t first, pgoff_t last);
 
 module_param_named(wicache_enable, xfs_wicache_enable, bool, 0444);
 MODULE_PARM_DESC(wicache_enable, "Enable experimental sparse write overlay");
@@ -295,6 +300,10 @@ module_param_cb(wicache_entry_bytes, &xfs_wicache_atomic64_ops,
 		&xfs_wicache_global_entry_bytes, 0444);
 module_param_cb(wicache_entry_peak_bytes, &xfs_wicache_atomic64_ops,
 		&xfs_wicache_global_entry_peak_bytes, 0444);
+module_param_cb(wicache_region_bytes, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_region_bytes, 0444);
+module_param_cb(wicache_region_peak_bytes, &xfs_wicache_atomic64_ops,
+		&xfs_wicache_global_region_peak_bytes, 0444);
 module_param_cb(wicache_front_iolock_ns, &xfs_wicache_atomic64_ops,
 		&xfs_wicache_global_front_iolock_ns, 0444);
 module_param_cb(wicache_front_iolock_calls, &xfs_wicache_atomic64_ops,
@@ -597,7 +606,8 @@ xfs_wicache_inode_release_file_if_empty(
 	spin_lock(&wi->file_lock);
 	if (!atomic_read(&wi->staging) &&
 	    !atomic_read(&wi->batch_active) &&
-	    !xa_marked(&wi->entries, XFS_WICACHE_XA_DIRTY)) {
+	    !xa_marked(&wi->entries, XFS_WICACHE_XA_DIRTY) &&
+	    !xa_marked(&wi->regions, XFS_WICACHE_XA_DIRTY)) {
 		file = wi->io_file;
 		wi->io_file = NULL;
 	}
@@ -1455,6 +1465,265 @@ xfs_wicache_entry_alloc(
 }
 
 static void
+xfs_wicache_region_account_add(
+	s64			bytes)
+{
+	s64			bytes_now, peak;
+
+	bytes_now = atomic64_add_return(bytes,
+			&xfs_wicache_global_region_bytes);
+	peak = atomic64_read(&xfs_wicache_global_region_peak_bytes);
+	while (bytes_now > peak) {
+		s64 seen = atomic64_cmpxchg(
+				&xfs_wicache_global_region_peak_bytes,
+				peak, bytes_now);
+
+		if (seen == peak)
+			break;
+		peak = seen;
+	}
+}
+
+static void
+xfs_wicache_region_account_sub(
+	s64			bytes)
+{
+	atomic64_sub(bytes, &xfs_wicache_global_region_bytes);
+}
+
+static size_t
+xfs_wicache_region_slots_size(
+	unsigned int		nr)
+{
+	return struct_size((struct xfs_wicache_region_slots *)NULL,
+			entries, nr);
+}
+
+static struct xfs_wicache_region_slots *
+xfs_wicache_region_slots_alloc(
+	struct xfs_wicache_inode *wi,
+	unsigned int		nr)
+{
+	struct xfs_wicache_region_slots *slots;
+	size_t			bytes = xfs_wicache_region_slots_size(nr);
+
+	if (xfs_wicache_charge(wi->wm, bytes, false, NULL))
+		return NULL;
+	slots = kzalloc(bytes, XFS_WICACHE_ACCOUNT_GFP(GFP_NOFS));
+	if (!slots) {
+		xfs_wicache_uncharge(wi->wm, bytes);
+		return NULL;
+	}
+	slots->capacity = nr;
+	xfs_wicache_region_account_add(bytes);
+	return slots;
+}
+
+static void
+xfs_wicache_region_slots_free(
+	struct xfs_wicache_inode *wi,
+	struct xfs_wicache_region_slots *slots)
+{
+	size_t			bytes;
+
+	if (!slots)
+		return;
+	bytes = xfs_wicache_region_slots_size(slots->capacity);
+	xfs_wicache_region_account_sub(bytes);
+	xfs_wicache_uncharge(wi->wm, bytes);
+	kfree(slots);
+}
+
+static struct xfs_wicache_region *
+xfs_wicache_region_alloc(
+	struct xfs_wicache_inode *wi)
+{
+	struct xfs_wicache_region *region;
+
+	if (xfs_wicache_charge(wi->wm, sizeof(*region), false, NULL))
+		return NULL;
+	region = kzalloc(sizeof(*region),
+			XFS_WICACHE_ACCOUNT_GFP(GFP_NOFS));
+	if (!region) {
+		xfs_wicache_uncharge(wi->wm, sizeof(*region));
+		return NULL;
+	}
+	refcount_set(&region->refcount, 1);
+	xfs_wicache_region_account_add(sizeof(*region));
+	return region;
+}
+
+static bool
+xfs_wicache_region_get(
+	struct xfs_wicache_region *region)
+{
+	return refcount_inc_not_zero(&region->refcount);
+}
+
+static void
+xfs_wicache_region_put(
+	struct xfs_wicache_inode *wi,
+	struct xfs_wicache_region *region)
+{
+	if (!region || !refcount_dec_and_test(&region->refcount))
+		return;
+	WARN_ON_ONCE(region->slots);
+	xfs_wicache_region_account_sub(sizeof(*region));
+	xfs_wicache_uncharge(wi->wm, sizeof(*region));
+	kfree(region);
+}
+
+static struct xfs_wicache_region *
+xfs_wicache_region_lookup_get(
+	struct xfs_wicache_inode *wi,
+	unsigned long		region_index)
+{
+	struct xfs_wicache_region *region;
+
+	xa_lock(&wi->regions);
+	region = xa_load(&wi->regions, region_index);
+	if (region && !xfs_wicache_region_get(region))
+		region = NULL;
+	xa_unlock(&wi->regions);
+	return region;
+}
+
+static bool
+xfs_wicache_region_valid(
+	struct xfs_wicache_region *region)
+{
+	struct xfs_wicache_region_slots *slots = region->slots;
+
+	if (!slots)
+		return !region->dirty;
+	return slots->nr &&
+		slots->nr <= slots->capacity &&
+		slots->capacity <= XFS_WICACHE_REGION_PAGES &&
+		hweight16(slots->present) == slots->nr &&
+		!(region->dirty & ~slots->present);
+}
+
+static void
+xfs_wicache_region_report_invalid(
+	unsigned long		region_index)
+{
+	atomic64_inc(&xfs_wicache_global_flush_errors);
+	pr_err_ratelimited("XFS StageIO: invalid fragment region %lu\n",
+			region_index);
+}
+
+static void
+xfs_wicache_region_remove_empty(
+	struct xfs_wicache_inode *wi,
+	unsigned long		region_index,
+	struct xfs_wicache_region *region)
+{
+	bool			removed = false;
+
+	xa_lock(&wi->regions);
+	if (xa_load(&wi->regions, region_index) == region &&
+	    !region->slots) {
+		__xa_erase(&wi->regions, region_index);
+		removed = true;
+	}
+	xa_unlock(&wi->regions);
+	if (removed)
+		xfs_wicache_region_put(wi, region);
+}
+
+static int
+xfs_wicache_region_insert_entry(
+	struct xfs_wicache_entry *entry)
+{
+	struct xfs_wicache_inode *wi = entry->wi;
+	unsigned long		region_index = entry->page_index >>
+					XFS_WICACHE_REGION_ORDER;
+	unsigned int		slot = entry->page_index &
+					XFS_WICACHE_REGION_MASK;
+	struct xfs_wicache_region *region, *candidate;
+	struct xfs_wicache_region_slots *slots, *new_slots;
+	unsigned int		rank, nr;
+	u16			present;
+	void			*old;
+
+retry_region:
+	region = xfs_wicache_region_lookup_get(wi, region_index);
+	if (!region) {
+		candidate = xfs_wicache_region_alloc(wi);
+		if (!candidate)
+			return -ENOMEM;
+		old = xa_cmpxchg(&wi->regions, region_index, NULL, candidate,
+				XFS_WICACHE_ACCOUNT_GFP(GFP_NOFS));
+		if (xa_is_err(old)) {
+			xfs_wicache_region_put(wi, candidate);
+			return xa_err(old);
+		}
+		if (old) {
+			xfs_wicache_region_put(wi, candidate);
+			cond_resched();
+			goto retry_region;
+		}
+		region = candidate;
+		xfs_wicache_region_get(region);
+	}
+
+retry_slots:
+	xa_lock(&wi->regions);
+	if (xa_load(&wi->regions, region_index) != region) {
+		xa_unlock(&wi->regions);
+		xfs_wicache_region_put(wi, region);
+		goto retry_region;
+	}
+	if (!xfs_wicache_region_valid(region)) {
+		xa_unlock(&wi->regions);
+		xfs_wicache_region_report_invalid(region_index);
+		xfs_wicache_region_put(wi, region);
+		return -EUCLEAN;
+	}
+	slots = region->slots;
+	if (slots && (slots->present & BIT(slot))) {
+		xa_unlock(&wi->regions);
+		xfs_wicache_region_put(wi, region);
+		return -EEXIST;
+	}
+	nr = slots ? slots->nr : 0;
+	present = slots ? slots->present : 0;
+	xa_unlock(&wi->regions);
+
+	new_slots = xfs_wicache_region_slots_alloc(wi, nr + 1);
+	if (!new_slots) {
+		xfs_wicache_region_remove_empty(wi, region_index, region);
+		xfs_wicache_region_put(wi, region);
+		return -ENOMEM;
+	}
+	xa_lock(&wi->regions);
+	if (xa_load(&wi->regions, region_index) != region ||
+	    region->slots != slots ||
+	    (slots && (slots->nr != nr || slots->present != present))) {
+		xa_unlock(&wi->regions);
+		xfs_wicache_region_slots_free(wi, new_slots);
+		cond_resched();
+		goto retry_slots;
+	}
+	rank = slots ? hweight16(slots->present & (BIT(slot) - 1)) : 0;
+	new_slots->present = present | BIT(slot);
+	new_slots->nr = nr + 1;
+	if (rank)
+		memcpy(new_slots->entries, slots->entries,
+			rank * sizeof(*new_slots->entries));
+	new_slots->entries[rank] = entry;
+	if (rank < nr)
+		memcpy(&new_slots->entries[rank + 1],
+			&slots->entries[rank],
+			(nr - rank) * sizeof(*new_slots->entries));
+	region->slots = new_slots;
+	xa_unlock(&wi->regions);
+	xfs_wicache_region_slots_free(wi, slots);
+	xfs_wicache_region_put(wi, region);
+	return 0;
+}
+
+static void
 xfs_wicache_entry_drop_buffers(
 	struct xfs_wicache_entry *entry)
 {
@@ -1506,8 +1775,11 @@ static void
 xfs_wicache_inode_purge_entries(
 	struct xfs_wicache_inode *wi)
 {
+	struct xfs_wicache_region *region;
+	struct xfs_wicache_region_slots *slots;
 	void			*node;
 	unsigned long		index;
+	unsigned int		i;
 
 	xa_for_each(&wi->entries, index, node) {
 		bool full = xa_get_mark(&wi->entries, index,
@@ -1528,6 +1800,20 @@ xfs_wicache_inode_purge_entries(
 		}
 		atomic64_dec(&wi->nr_entries);
 	}
+	xa_for_each(&wi->regions, index, region) {
+		xa_erase(&wi->regions, index);
+		slots = region->slots;
+		region->slots = NULL;
+		for (i = 0; slots && i < slots->nr; i++) {
+			struct xfs_wicache_entry *entry = slots->entries[i];
+
+			xfs_wicache_entry_drop_buffers(entry);
+			xfs_wicache_entry_put(entry);
+			atomic64_dec(&wi->nr_entries);
+		}
+		xfs_wicache_region_slots_free(wi, slots);
+		xfs_wicache_region_put(wi, region);
+	}
 	xfs_wicache_inode_release_file_if_empty(wi);
 }
 
@@ -1537,6 +1823,7 @@ xfs_wicache_inode_destroy(
 {
 	xfs_wicache_inode_purge_entries(wi);
 	xa_destroy(&wi->entries);
+	xa_destroy(&wi->regions);
 }
 
 static struct xfs_wicache_inode *
@@ -1559,6 +1846,7 @@ xfs_wicache_inode_alloc(
 	wi->ip = ip;
 	spin_lock_init(&wi->file_lock);
 	xa_init(&wi->entries);
+	xa_init(&wi->regions);
 	atomic64_set(&wi->dirty_bytes, 0);
 	atomic64_set(&wi->nr_entries, 0);
 	atomic64_set(&wi->seq, 0);
@@ -1653,6 +1941,8 @@ xfs_wicache_reset_stats(void)
 	atomic64_set(&xfs_wicache_global_finish_ns, 0);
 	atomic64_set(&xfs_wicache_global_entry_bytes, 0);
 	atomic64_set(&xfs_wicache_global_entry_peak_bytes, 0);
+	atomic64_set(&xfs_wicache_global_region_bytes, 0);
+	atomic64_set(&xfs_wicache_global_region_peak_bytes, 0);
 	atomic64_set(&xfs_wicache_global_front_iolock_ns, 0);
 	atomic64_set(&xfs_wicache_global_front_iolock_calls, 0);
 	atomic64_set(&xfs_wicache_global_front_iolock_max_ns, 0);
@@ -1994,7 +2284,9 @@ xfs_wicache_kick_inode(
 	struct xfs_wicache_inode *wi,
 	unsigned long		delay)
 {
-	if (!wi->wm->control_wq)
+	if (!READ_ONCE(wi->wm->enabled) ||
+	    READ_ONCE(wi->state) != XFS_WICACHE_INODE_ACTIVE ||
+	    !wi->wm->control_wq)
 		return;
 	if (!queue_delayed_work(wi->wm->control_wq, &wi->flush_work, delay))
 		mod_delayed_work(wi->wm->control_wq, &wi->flush_work, delay);
@@ -2051,7 +2343,13 @@ xfs_wicache_mount_free(
 		flush_workqueue(wm->handoff_wq);
 		xfs_wicache_drain_reuse_folios(wm);
 
-		wm->enabled = false;
+		WRITE_ONCE(wm->enabled, false);
+		mutex_lock(&wm->inode_lock);
+		list_for_each_entry(wi, &wm->inodes, mount_node) {
+			WRITE_ONCE(wi->state, XFS_WICACHE_INODE_DYING);
+			cancel_delayed_work_sync(&wi->flush_work);
+		}
+		mutex_unlock(&wm->inode_lock);
 		destroy_workqueue(wm->control_wq);
 		destroy_workqueue(wm->prepare_wq);
 		destroy_workqueue(wm->persist_wq);
@@ -2190,14 +2488,22 @@ xfs_wicache_lookup_entry(
 	struct xfs_wicache_inode *wi,
 	pgoff_t		page_index)
 {
-	XA_STATE(xas, &wi->entries, page_index);
+	unsigned long		region_index = page_index >>
+					XFS_WICACHE_REGION_ORDER;
+	unsigned int		slot = page_index & XFS_WICACHE_REGION_MASK;
+	struct xfs_wicache_region *region;
+	struct xfs_wicache_region_slots *slots;
 	struct xfs_wicache_entry *entry = NULL;
-	void			*node;
+	unsigned int		rank;
 
-	xas_lock(&xas);
-	node = xas_load(&xas);
-	if (node && !xas_get_mark(&xas, XFS_WICACHE_XA_FULL)) {
-		entry = node;
+	xa_lock(&wi->regions);
+	region = xa_load(&wi->regions, region_index);
+	slots = region ? region->slots : NULL;
+	if (region && !xfs_wicache_region_valid(region)) {
+		xfs_wicache_region_report_invalid(region_index);
+	} else if (slots && (slots->present & BIT(slot))) {
+		rank = hweight16(slots->present & (BIT(slot) - 1));
+		entry = slots->entries[rank];
 		if (!xfs_wicache_entry_get(entry) ||
 		    READ_ONCE(entry->state) == XFS_WICACHE_ENTRY_INVALID) {
 			if (refcount_read(&entry->refcount))
@@ -2205,7 +2511,7 @@ xfs_wicache_lookup_entry(
 			entry = NULL;
 		}
 	}
-	xas_unlock(&xas);
+	xa_unlock(&wi->regions);
 	return entry;
 }
 
@@ -2350,61 +2656,20 @@ xfs_wicache_raw_entry_del(void)
 static struct xfs_wicache_entry *
 xfs_wicache_promote_full(
 	struct xfs_wicache_inode *wi,
-	struct file		*file,
 	pgoff_t		page_index)
 {
-	struct xfs_wicache_entry *entry;
 	struct folio		*folio;
-	XA_STATE(xas, &wi->entries, page_index);
-	void			*node;
+	int			error;
 
 retry:
-	if (!file)
-		return ERR_PTR(-EBADF);
-	entry = xfs_wicache_lookup_entry(wi, page_index);
-	if (entry)
-		return entry;
 	folio = xfs_wicache_lookup_full(wi, page_index);
 	if (!folio)
 		return NULL;
-	if (folio_order(folio)) {
-		folio_put(folio);
-		return ERR_PTR(-EAGAIN);
-	}
-	entry = xfs_wicache_entry_alloc(wi, file, page_index, GFP_NOFS);
-	if (!entry) {
-		folio_put(folio);
-		return ERR_PTR(-ENOMEM);
-	}
-
-	xas_set(&xas, page_index);
-	xas_lock(&xas);
-	node = xas_load(&xas);
-	if (node == folio && xas_get_mark(&xas, XFS_WICACHE_XA_FULL)) {
-		if (xas_get_mark(&xas, XFS_WICACHE_XA_FLUSHING)) {
-			struct file *held = entry->io_file;
-
-			entry->io_file = NULL;
-			xas_unlock(&xas);
-			xfs_wicache_owner_file_put(held);
-			xfs_wicache_entry_put(entry);
-			folio_put(folio);
-			xfs_wicache_wait_raw_flush(wi, page_index);
-			goto retry;
-		}
-		entry->active_full = folio;
-		xas_store(&xas, entry);
-		xas_clear_mark(&xas, XFS_WICACHE_XA_FULL);
-		xfs_wicache_entry_get(entry);
-		xas_unlock(&xas);
-		xfs_wicache_raw_entry_del();
-		folio_put(folio);
-		return entry;
-	}
-	xas_unlock(&xas);
-	xfs_wicache_entry_put(entry);
 	folio_put(folio);
-	cond_resched();
+	error = xfs_wicache_range_drain(wi,
+			(loff_t)page_index << PAGE_SHIFT, PAGE_SIZE);
+	if (error)
+		return ERR_PTR(error);
 	goto retry;
 }
 
@@ -2420,7 +2685,7 @@ retry:
 	entry = xfs_wicache_lookup_entry(wi, page_index);
 	if (entry)
 		return entry;
-	entry = xfs_wicache_promote_full(wi, file, page_index);
+	entry = xfs_wicache_promote_full(wi, page_index);
 	if (entry)
 		return entry;
 
@@ -2428,15 +2693,20 @@ retry:
 	if (!entry)
 		return ERR_PTR(-ENOMEM);
 
-	old = xa_cmpxchg(&wi->entries, page_index, NULL, entry,
-			XFS_WICACHE_ACCOUNT_GFP(GFP_NOFS));
-	if (xa_is_err(old)) {
-		struct file *held = entry->io_file;
+	old = NULL;
+	{
+		int error = xfs_wicache_region_insert_entry(entry);
 
-		entry->io_file = NULL;
-		xfs_wicache_owner_file_put(held);
-		xfs_wicache_entry_put(entry);
-		return ERR_PTR(xa_err(old));
+		if (error == -EEXIST)
+			old = entry;
+		else if (error) {
+			struct file *held = entry->io_file;
+
+			entry->io_file = NULL;
+			xfs_wicache_owner_file_put(held);
+			xfs_wicache_entry_put(entry);
+			return ERR_PTR(error);
+		}
 	}
 	if (old) {
 		struct file *held = entry->io_file;
@@ -2458,12 +2728,28 @@ xfs_wicache_mark_dirty(
 	struct xfs_wicache_entry *entry)
 {
 	struct xfs_wicache_inode *wi = entry->wi;
+	unsigned long		region_index = entry->page_index >>
+					XFS_WICACHE_REGION_ORDER;
+	unsigned int		slot = entry->page_index & XFS_WICACHE_REGION_MASK;
+	struct xfs_wicache_region *region;
+	struct xfs_wicache_region_slots *slots;
+	unsigned int		rank;
 
-	xa_lock(&wi->entries);
-	if (!entry->queued)
-		__xa_set_mark(&wi->entries, entry->page_index,
+	xa_lock(&wi->regions);
+	region = xa_load(&wi->regions, region_index);
+	slots = region ? region->slots : NULL;
+	if (region && !xfs_wicache_region_valid(region)) {
+		xfs_wicache_region_report_invalid(region_index);
+	} else if (slots && (slots->present & BIT(slot))) {
+		rank = hweight16(slots->present & (BIT(slot) - 1));
+		if (slots->entries[rank] != entry || entry->queued)
+			goto out_unlock;
+		region->dirty |= BIT(slot);
+		__xa_set_mark(&wi->regions, region_index,
 				XFS_WICACHE_XA_DIRTY);
-	xa_unlock(&wi->entries);
+	}
+out_unlock:
+	xa_unlock(&wi->regions);
 }
 
 bool
@@ -2537,6 +2823,20 @@ xfs_wicache_store_raw_folio(
 	int			error;
 	unsigned int		order = folio_order(folio);
 
+	if (order && xfs_wicache_region_range_has_entry(wi, page_index,
+			page_index + folio_nr_pages(folio) - 1))
+		return -EEXIST;
+	if (!order) {
+		entry = xfs_wicache_lookup_entry(wi, page_index);
+		if (entry) {
+			error = xfs_wicache_stage_full_folio(entry, folio);
+			if (!error)
+				xfs_wicache_mark_dirty(entry);
+			xfs_wicache_entry_put(entry);
+			return error;
+		}
+	}
+
 	if (order) {
 		bool conflict = false;
 
@@ -2579,25 +2879,6 @@ retry_store:
 			xas_unlock(&xas);
 			xfs_wicache_wait_raw_flush(wi, page_index);
 			goto retry_store;
-		}
-		if (old && !xas_get_mark(&xas, XFS_WICACHE_XA_FULL)) {
-			entry = old;
-			if (!xfs_wicache_entry_get(entry))
-				entry = NULL;
-			xas_unlock(&xas);
-			if (!entry) {
-				cond_resched();
-				goto retry_store;
-			}
-			error = xfs_wicache_stage_full_folio(entry, folio);
-			if (!error)
-				xfs_wicache_mark_dirty(entry);
-			xfs_wicache_entry_put(entry);
-			if (error == -EAGAIN) {
-				cond_resched();
-				goto retry_store;
-			}
-			return error;
 		}
 		xas_store(&xas, folio);
 		if (!xas_error(&xas)) {
@@ -2738,7 +3019,7 @@ xfs_wicache_stage_raw_run(
 				done += large_bytes;
 				continue;
 			}
-			if (error != -ENOMEM)
+			if (error != -ENOMEM && error != -EEXIST)
 				break;
 			error = 0;
 		}
@@ -3027,14 +3308,21 @@ xfs_wicache_overlay_folio(
 	loff_t			pos,
 	size_t			count)
 {
-	loff_t folio_start = (loff_t)folio->index << PAGE_SHIFT;
-	loff_t copy_start = max_t(loff_t, pos, folio_start);
-	loff_t copy_end = min_t(loff_t, pos + count,
-			folio_start + folio_size(folio));
-	struct iov_iter dst = *to;
-	size_t bytes;
+	loff_t			folio_start;
+	loff_t			copy_start;
+	loff_t			copy_end;
+	struct iov_iter		dst;
+	size_t			bytes;
 
-	if (!folio || copy_start >= copy_end)
+	if (!folio)
+		return 0;
+	folio_start = (loff_t)folio->index << PAGE_SHIFT;
+	copy_start = max_t(loff_t, pos, folio_start);
+	copy_end = min_t(loff_t, pos + count,
+			folio_start + folio_size(folio));
+	dst = *to;
+
+	if (copy_start >= copy_end)
 		return 0;
 	bytes = copy_end - copy_start;
 	iov_iter_advance(&dst, copy_start - pos);
@@ -3191,6 +3479,75 @@ xfs_wicache_inode_has_dirty(
 }
 
 static bool
+xfs_wicache_region_range_has_entry(
+	struct xfs_wicache_inode *wi,
+	pgoff_t		first,
+	pgoff_t		last)
+{
+	unsigned long		region_index;
+	unsigned long		region_first = first >> XFS_WICACHE_REGION_ORDER;
+	unsigned long		region_last = last >> XFS_WICACHE_REGION_ORDER;
+	struct xfs_wicache_region *region;
+	bool			found = false;
+	unsigned int		i;
+
+	xa_lock(&wi->regions);
+	xa_for_each_range(&wi->regions, region_index, region,
+			region_first, region_last) {
+		struct xfs_wicache_region_slots *slots = region->slots;
+
+		if (!xfs_wicache_region_valid(region)) {
+			xfs_wicache_region_report_invalid(region_index);
+			continue;
+		}
+		for (i = 0; slots && i < slots->nr; i++) {
+			pgoff_t page_index = slots->entries[i]->page_index;
+
+			if (page_index >= first && page_index <= last) {
+				found = true;
+				goto out_unlock;
+			}
+		}
+	}
+out_unlock:
+	xa_unlock(&wi->regions);
+	return found;
+}
+
+static unsigned long
+xfs_wicache_region_range_entries(
+	struct xfs_wicache_inode *wi,
+	pgoff_t		first,
+	pgoff_t		last)
+{
+	unsigned long		region_index;
+	unsigned long		region_first = first >> XFS_WICACHE_REGION_ORDER;
+	unsigned long		region_last = last >> XFS_WICACHE_REGION_ORDER;
+	struct xfs_wicache_region *region;
+	unsigned long		nr = 0;
+	unsigned int		i;
+
+	xa_lock(&wi->regions);
+	xa_for_each_range(&wi->regions, region_index, region,
+			region_first, region_last) {
+		struct xfs_wicache_region_slots *slots = region->slots;
+
+		if (!xfs_wicache_region_valid(region)) {
+			xfs_wicache_region_report_invalid(region_index);
+			continue;
+		}
+		for (i = 0; slots && i < slots->nr; i++) {
+			pgoff_t page_index = slots->entries[i]->page_index;
+
+			if (page_index >= first && page_index <= last)
+				nr++;
+		}
+	}
+	xa_unlock(&wi->regions);
+	return nr;
+}
+
+static bool
 xfs_wicache_index_range_has_entry(
 	struct xfs_wicache_inode *wi,
 	pgoff_t		first,
@@ -3202,7 +3559,7 @@ xfs_wicache_index_range_has_entry(
 	rcu_read_lock();
 	found = xa_find(&wi->entries, &index, last, XA_PRESENT) != NULL;
 	rcu_read_unlock();
-	return found;
+	return found || xfs_wicache_region_range_has_entry(wi, first, last);
 }
 
 static bool
@@ -3217,9 +3574,7 @@ xfs_wicache_index_range_has_dirty(
 
 	xa_lock(&wi->entries);
 	xa_for_each_range(&wi->entries, index, node, first, last) {
-		if (!xa_get_mark(&wi->entries, index,
-				XFS_WICACHE_XA_FULL) ||
-		    xa_get_mark(&wi->entries, index,
+		if (xa_get_mark(&wi->entries, index,
 				XFS_WICACHE_XA_DIRTY) ||
 		    xa_get_mark(&wi->entries, index,
 				XFS_WICACHE_XA_FLUSHING)) {
@@ -3228,7 +3583,7 @@ xfs_wicache_index_range_has_dirty(
 		}
 	}
 	xa_unlock(&wi->entries);
-	return found;
+	return found || xfs_wicache_region_range_has_entry(wi, first, last);
 }
 
 static void
@@ -3292,7 +3647,7 @@ xfs_wicache_index_range_entries(
 		index++;
 	}
 	rcu_read_unlock();
-	return nr;
+	return nr + xfs_wicache_region_range_entries(wi, first, last);
 }
 
 static void
@@ -3352,7 +3707,7 @@ xfs_wicache_index_range_drain(
 	spin_lock(&wi->drain_lock);
 	wi->drain_range_active = false;
 	spin_unlock(&wi->drain_lock);
-	if (atomic64_read(&wi->nr_entries))
+	if (xfs_wicache_index_range_has_dirty(wi, 0, ULONG_MAX))
 		xfs_wicache_kick_inode(wi,
 				msecs_to_jiffies(xfs_wicache_delay_ms));
 	mutex_unlock(&wi->drain_mutex);
@@ -3519,16 +3874,35 @@ xfs_wicache_requeue_entry(
 	bool			dirty)
 {
 	struct xfs_wicache_inode *wi = entry->wi;
+	unsigned long		region_index = entry->page_index >>
+					XFS_WICACHE_REGION_ORDER;
+	unsigned int		slot = entry->page_index & XFS_WICACHE_REGION_MASK;
+	struct xfs_wicache_region *region;
+	struct xfs_wicache_region_slots *slots;
+	unsigned int		rank;
 
-	xa_lock(&wi->entries);
-	entry->queued = false;
-	if (dirty)
-		__xa_set_mark(&wi->entries, entry->page_index,
-				XFS_WICACHE_XA_DIRTY);
-	else
-		__xa_clear_mark(&wi->entries, entry->page_index,
-				XFS_WICACHE_XA_DIRTY);
-	xa_unlock(&wi->entries);
+	xa_lock(&wi->regions);
+	region = xa_load(&wi->regions, region_index);
+	slots = region ? region->slots : NULL;
+	if (region && !xfs_wicache_region_valid(region)) {
+		xfs_wicache_region_report_invalid(region_index);
+	} else if (slots && (slots->present & BIT(slot))) {
+		rank = hweight16(slots->present & (BIT(slot) - 1));
+		if (slots->entries[rank] == entry) {
+			entry->queued = false;
+			if (dirty)
+				region->dirty |= BIT(slot);
+			else
+				region->dirty &= ~BIT(slot);
+			if (region->dirty)
+				__xa_set_mark(&wi->regions, region_index,
+						XFS_WICACHE_XA_DIRTY);
+			else
+				__xa_clear_mark(&wi->regions, region_index,
+						XFS_WICACHE_XA_DIRTY);
+		}
+	}
+	xa_unlock(&wi->regions);
 }
 
 static void
@@ -3536,11 +3910,49 @@ xfs_wicache_remove_entry(
 	struct xfs_wicache_entry *entry)
 {
 	struct xfs_wicache_inode *wi = entry->wi;
-	struct xfs_wicache_entry *old;
+	unsigned long		region_index = entry->page_index >>
+					XFS_WICACHE_REGION_ORDER;
+	unsigned int		slot = entry->page_index & XFS_WICACHE_REGION_MASK;
+	struct xfs_wicache_region *region;
+	struct xfs_wicache_region_slots *slots = NULL;
+	unsigned int		rank;
+	bool			removed = false, removed_region = false;
 
-	old = xa_cmpxchg(&wi->entries, entry->page_index, entry, NULL,
-			GFP_NOFS);
-	if (old == entry) {
+	xa_lock(&wi->regions);
+	region = xa_load(&wi->regions, region_index);
+	if (region && !xfs_wicache_region_valid(region)) {
+		xfs_wicache_region_report_invalid(region_index);
+		goto out_unlock;
+	}
+	if (!region || !region->slots ||
+	    !(region->slots->present & BIT(slot)))
+		goto out_unlock;
+	slots = region->slots;
+	rank = hweight16(slots->present & (BIT(slot) - 1));
+	if (slots->entries[rank] != entry)
+		goto out_unlock;
+	if (rank + 1 < slots->nr)
+		memmove(&slots->entries[rank], &slots->entries[rank + 1],
+			(slots->nr - rank - 1) * sizeof(*slots->entries));
+	slots->nr--;
+	slots->present &= ~BIT(slot);
+	region->dirty &= ~BIT(slot);
+	if (!slots->nr) {
+		region->slots = NULL;
+		__xa_erase(&wi->regions, region_index);
+		removed_region = true;
+	} else if (!region->dirty) {
+		__xa_clear_mark(&wi->regions, region_index,
+				XFS_WICACHE_XA_DIRTY);
+	}
+	removed = true;
+out_unlock:
+	xa_unlock(&wi->regions);
+	if (removed_region) {
+		xfs_wicache_region_slots_free(wi, slots);
+		xfs_wicache_region_put(wi, region);
+	}
+	if (removed) {
 		atomic64_dec(&wi->nr_entries);
 		xfs_wicache_entry_put(entry);
 		xfs_wicache_inode_release_file_if_empty(wi);
@@ -4416,25 +4828,56 @@ retry_raw:
 	}
 
 	scan_start = ktime_get_ns();
-	xa_lock(&wi->entries);
+	xa_lock(&wi->regions);
 	{
-		XA_STATE(xas, &wi->entries, first);
+		XA_STATE(xas, &wi->regions,
+				first >> XFS_WICACHE_REGION_ORDER);
+		unsigned long region_last = last >> XFS_WICACHE_REGION_ORDER;
+		struct xfs_wicache_region *region;
 
-		xas_for_each_marked(&xas, entry, last,
+		xas_for_each_marked(&xas, region, region_last,
 				XFS_WICACHE_XA_DIRTY) {
-			if (xas_get_mark(&xas, XFS_WICACHE_XA_FULL))
+			struct xfs_wicache_region_slots *slots = region->slots;
+			unsigned long dirty = region->dirty;
+			unsigned int slot;
+
+			if (!xfs_wicache_region_valid(region)) {
+				xfs_wicache_region_report_invalid(xas.xa_index);
+				xas_clear_mark(&xas, XFS_WICACHE_XA_DIRTY);
 				continue;
-			if (WARN_ON_ONCE(!xfs_wicache_entry_get(entry)))
-				break;
-			xas_clear_mark(&xas, XFS_WICACHE_XA_DIRTY);
-			entry->queued = true;
-			batch->entries[queued++] = entry;
+			}
+
+			for_each_set_bit(slot, &dirty,
+					XFS_WICACHE_REGION_PAGES) {
+				pgoff_t page_index = (xas.xa_index <<
+						XFS_WICACHE_REGION_ORDER) + slot;
+				unsigned int rank;
+
+				if (page_index < first || page_index > last)
+					continue;
+				rank = hweight16(slots->present &
+						(BIT(slot) - 1));
+				entry = slots->entries[rank];
+				if (!xfs_wicache_entry_get(entry)) {
+					xfs_wicache_region_report_invalid(
+							xas.xa_index);
+					break;
+				}
+				region->dirty &= ~BIT(slot);
+				entry->queued = true;
+				batch->entries[queued++] = entry;
+				if (queued == xfs_wicache_batch)
+					break;
+			}
+			if (!region->dirty)
+				xas_clear_mark(&xas, XFS_WICACHE_XA_DIRTY);
 			if (queued == xfs_wicache_batch)
 				break;
 		}
 	}
-	more_dirty = xa_marked(&wi->entries, XFS_WICACHE_XA_DIRTY);
-	xa_unlock(&wi->entries);
+	more_dirty = xa_marked(&wi->entries, XFS_WICACHE_XA_DIRTY) ||
+		xa_marked(&wi->regions, XFS_WICACHE_XA_DIRTY);
+	xa_unlock(&wi->regions);
 	atomic64_add(ktime_get_ns() - scan_start,
 			&xfs_wicache_global_scan_ns);
 
