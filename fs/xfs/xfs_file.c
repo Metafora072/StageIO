@@ -1743,7 +1743,13 @@ xfs_file_wicache_write(
 	has_entry = wi && xfs_wicache_range_has_entry(wi, pos, count);
 	if (has_entry && wi &&
 	    xfs_wicache_range_has_large_folio(wi, pos, count)) {
-		ret = xfs_wicache_range_drain(wi, pos, count);
+		loff_t drain_start = round_down(pos,
+				PAGE_SIZE << XFS_WICACHE_HANDOFF_ORDER);
+		loff_t drain_end = round_up(pos + count,
+				PAGE_SIZE << XFS_WICACHE_HANDOFF_ORDER);
+
+		ret = xfs_wicache_range_drain(wi, drain_start,
+				drain_end - drain_start);
 		if (ret)
 			goto out_admission;
 		has_entry = false;

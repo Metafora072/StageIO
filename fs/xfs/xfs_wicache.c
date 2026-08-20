@@ -2878,6 +2878,7 @@ retry_store:
 		    xas_get_mark(&xas, XFS_WICACHE_XA_FLUSHING)) {
 			xas_unlock(&xas);
 			xfs_wicache_wait_raw_flush(wi, page_index);
+			xas_reset(&xas);
 			goto retry_store;
 		}
 		xas_store(&xas, folio);
