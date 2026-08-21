@@ -13,7 +13,7 @@ struct xfs_ail;
 struct xfs_quotainfo;
 struct xfs_da_geometry;
 struct xfs_perag;
-struct xfs_wicache_mount;
+struct xfs_stageio_mount;
 
 /* dynamic preallocation free space thresholds, 5% down to 1% */
 enum {
@@ -114,7 +114,7 @@ typedef struct xfs_mount {
 	struct workqueue_struct	*m_sync_workqueue;
 	struct workqueue_struct *m_blockgc_wq;
 	struct workqueue_struct *m_inodegc_wq;
-	struct xfs_wicache_mount *m_wicache;	/* WICache */
+	struct xfs_stageio_mount *m_stageio;	/* StageIO */
 
 	int			m_bsize;	/* fs logical block size */
 	uint8_t			m_blkbit_log;	/* blocklog + NBBY */

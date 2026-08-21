@@ -24,7 +24,7 @@
 #include "xfs_pnfs.h"
 #include "xfs_iomap.h"
 #include "xfs_reflink.h"
-#include "xfs_wicache.h"
+#include "xfs_stageio.h"
 
 #include <linux/dax.h>
 #include <linux/falloc.h>
@@ -152,21 +152,21 @@ xfs_file_fsync(
 	struct xfs_mount	*mp = ip->i_mount;
 	int			error, err2;
 	int			log_flushed = 0;
-#ifdef USE_WICACHE
-	struct xfs_wicache_mount *wm = mp->m_wicache;
-	struct xfs_wicache_inode *wi;
+#ifdef USE_STAGEIO
+	struct xfs_stageio_mount *wm = mp->m_stageio;
+	struct xfs_stageio_inode *wi;
 	struct mutex		*admission;
 #endif
 
 	trace_xfs_file_fsync(ip);
 
-#ifdef USE_WICACHE
+#ifdef USE_STAGEIO
 	if (wm && wm->enabled) {
-		admission = xfs_wicache_admission_lock(wm, ip);
+		admission = xfs_stageio_admission_lock(wm, ip);
 		mutex_lock(admission);
-		wi = xfs_wicache_inode_lookup(wm, ip);
-		error = wi ? xfs_wicache_inode_drain(wi) : 0;
-		xfs_wicache_inode_put(wi);
+		wi = xfs_stageio_inode_lookup(wm, ip);
+		error = wi ? xfs_stageio_inode_drain(wi) : 0;
+		xfs_stageio_inode_put(wi);
 		mutex_unlock(admission);
 		if (error)
 			return error;
@@ -323,16 +323,16 @@ xfs_file_dax_read(
 	return ret;
 }
 
-#ifdef USE_WICACHE
+#ifdef USE_STAGEIO
 static ssize_t
-xfs_file_wicache_read(
+xfs_file_stageio_read(
 	struct kiocb		*iocb,
 	struct iov_iter		*to)
 {
 	struct inode		*inode = file_inode(iocb->ki_filp);
 	struct xfs_inode	*ip = XFS_I(inode);
-	struct xfs_wicache_mount *wm = ip->i_mount->m_wicache;
-	struct xfs_wicache_inode *wi;
+	struct xfs_stageio_mount *wm = ip->i_mount->m_stageio;
+	struct xfs_stageio_inode *wi;
 	struct iov_iter		overlay = *to;
 	loff_t			pos = iocb->ki_pos;
 	ssize_t			ret;
@@ -340,13 +340,13 @@ xfs_file_wicache_read(
 
 	if (!wm || !wm->enabled)
 		return -EOPNOTSUPP;
-	wi = xfs_wicache_inode_lookup(wm, ip);
-	if (!wi || !xfs_wicache_inode_has_dirty(wi)) {
-		xfs_wicache_inode_put(wi);
+	wi = xfs_stageio_inode_lookup(wm, ip);
+	if (!wi || !xfs_stageio_inode_has_dirty(wi)) {
+		xfs_stageio_inode_put(wi);
 		return -EOPNOTSUPP;
 	}
 
-	xfs_wicache_read_lock(wi);
+	xfs_stageio_read_lock(wi);
 	ret = xfs_ilock_iocb(iocb, XFS_IOLOCK_SHARED);
 	if (!ret) {
 		loff_t isize = i_size_read(inode);
@@ -355,7 +355,7 @@ xfs_file_wicache_read(
 		if (pos < isize)
 			clean_count = min_t(loff_t, iov_iter_count(to),
 					isize - pos);
-		ret = xfs_wicache_read_clean_iter(wi, to, pos, clean_count);
+		ret = xfs_stageio_read_clean_iter(wi, to, pos, clean_count);
 		if (ret >= 0) {
 			iocb->ki_pos = pos + ret;
 			clean_direct = true;
@@ -364,17 +364,17 @@ xfs_file_wicache_read(
 		}
 		xfs_iunlock(ip, XFS_IOLOCK_SHARED);
 		if (!clean_direct && ret > 0 &&
-		    xfs_wicache_overlay_iter(wi, &overlay,
+		    xfs_stageio_overlay_iter(wi, &overlay,
 				pos, ret))
 			ret = -EFAULT;
 	}
-	xfs_wicache_read_unlock(wi);
-	xfs_wicache_inode_put(wi);
+	xfs_stageio_read_unlock(wi);
+	xfs_stageio_inode_put(wi);
 	if (ret > 0)
 		file_accessed(iocb->ki_filp);
 	return ret;
 }
-#endif /* USE_WICACHE */
+#endif /* USE_STAGEIO */
 
 STATIC ssize_t
 xfs_file_buffered_read(
@@ -386,9 +386,9 @@ xfs_file_buffered_read(
 
 	trace_xfs_file_buffered_read(iocb, to);
 
-#ifdef USE_WICACHE
-	// 对于 buffered read，尝试走 WICache 路径，失败后再回退到原生 buffered read。
-	ret = xfs_file_wicache_read(iocb, to);
+#ifdef USE_STAGEIO
+	// 对于 buffered read，尝试走 StageIO 路径，失败后再回退到原生 buffered read。
+	ret = xfs_file_stageio_read(iocb, to);
 	if (ret != -EOPNOTSUPP)
 		return ret;
 #endif
@@ -805,9 +805,9 @@ xfs_file_dio_write(
 	return xfs_file_dio_write_aligned(ip, iocb, from);
 }
 
-#ifdef USE_WICACHE
+#ifdef USE_STAGEIO
 ssize_t
-xfs_wicache_dio_read_folio(
+xfs_stageio_dio_read_folio(
 	struct file		*file,
 	loff_t			pos,
 	struct folio		*folio)
@@ -827,7 +827,7 @@ xfs_wicache_dio_read_folio(
 }
 
 ssize_t
-xfs_wicache_dio_write_folio(
+xfs_stageio_dio_write_folio(
 	struct file		*file,
 	loff_t			pos,
 	struct folio		*folio)
@@ -847,7 +847,7 @@ xfs_wicache_dio_write_folio(
 }
 
 static ssize_t
-xfs_wicache_dio_folios(
+xfs_stageio_dio_folios(
 	struct file		*file,
 	loff_t			pos,
 	struct folio		**folios,
@@ -897,29 +897,29 @@ xfs_wicache_dio_folios(
 }
 
 ssize_t
-xfs_wicache_dio_read_folios(
+xfs_stageio_dio_read_folios(
 	struct file		*file,
 	loff_t			pos,
 	struct folio		**folios,
 	unsigned int		nr)
 {
-	return xfs_wicache_dio_folios(file, pos, folios, nr, ITER_DEST,
+	return xfs_stageio_dio_folios(file, pos, folios, nr, ITER_DEST,
 			NULL, NULL);
 }
 
 ssize_t
-xfs_wicache_dio_write_folios(
+xfs_stageio_dio_write_folios(
 	struct file		*file,
 	loff_t			pos,
 	struct folio		**folios,
 	unsigned int		nr)
 {
-	return xfs_wicache_dio_folios(file, pos, folios, nr, ITER_SOURCE,
+	return xfs_stageio_dio_folios(file, pos, folios, nr, ITER_SOURCE,
 			NULL, NULL);
 }
 
 ssize_t
-xfs_wicache_dio_write_folios_timed(
+xfs_stageio_dio_write_folios_timed(
 	struct file		*file,
 	loff_t			pos,
 	struct folio		**folios,
@@ -927,12 +927,12 @@ xfs_wicache_dio_write_folios_timed(
 	u64			*bvec_ns,
 	u64			*dio_ns)
 {
-	return xfs_wicache_dio_folios(file, pos, folios, nr, ITER_SOURCE,
+	return xfs_stageio_dio_folios(file, pos, folios, nr, ITER_SOURCE,
 			bvec_ns, dio_ns);
 }
 
 ssize_t
-xfs_wicache_dio_write_bvecs_timed(
+xfs_stageio_dio_write_bvecs_timed(
 	struct file		*file,
 	loff_t			pos,
 	struct bio_vec		*bvec,
@@ -1065,11 +1065,11 @@ out:
 
 
 /*
- * WICache Buffered Write 入口。
+ * StageIO Buffered Write 入口。
  */
-#ifdef USE_WICACHE
+#ifdef USE_STAGEIO
 static bool
-xfs_file_wicache_written(
+xfs_file_stageio_written(
 	struct xfs_inode	*ip,
 	loff_t			pos,
 	size_t			count)
@@ -1100,8 +1100,8 @@ xfs_file_wicache_written(
 }
 
 static ssize_t
-xfs_file_wicache_stage_part(
-	struct xfs_wicache_inode *wi,
+xfs_file_stageio_stage_part(
+	struct xfs_stageio_inode *wi,
 	struct kiocb		*iocb,
 	struct iov_iter		*from,
 	size_t			count,
@@ -1114,13 +1114,13 @@ xfs_file_wicache_stage_part(
 
 	iov_iter_truncate(&part, count);
 	start = ktime_get_ns();
-	ret = xfs_wicache_stage_iter(wi, iocb->ki_filp, &part,
+	ret = xfs_stageio_stage_iter(wi, iocb->ki_filp, &part,
 			iocb->ki_pos, count);
 	if (small_write)
-		xfs_wicache_record_small_write(ret > 0 ? ret : 0,
+		xfs_stageio_record_small_write(ret > 0 ? ret : 0,
 				ktime_get_ns() - start);
 	else
-		xfs_wicache_record_fragment(ret > 0 ? ret : 0,
+		xfs_stageio_record_fragment(ret > 0 ? ret : 0,
 				ktime_get_ns() - start);
 	if (ret > 0) {
 		iov_iter_advance(from, ret);
@@ -1131,7 +1131,7 @@ xfs_file_wicache_stage_part(
 }
 
 static ssize_t
-xfs_file_wicache_user_dio_chunk(
+xfs_file_stageio_user_dio_chunk(
 	struct kiocb		*iocb,
 	struct iov_iter		*from,
 	size_t			count,
@@ -1157,7 +1157,7 @@ xfs_file_wicache_user_dio_chunk(
 }
 
 static bool
-xfs_file_wicache_user_dio_aligned(
+xfs_file_stageio_user_dio_aligned(
 	struct kiocb		*iocb,
 	struct iov_iter		*from,
 	size_t			count)
@@ -1172,12 +1172,12 @@ xfs_file_wicache_user_dio_aligned(
 	return bdev_iter_is_aligned(target->bt_bdev, &part);
 }
 
-#define XFS_WICACHE_PIPE_CHUNK	(2UL << 20)
-#define XFS_WICACHE_HANDOFF_ORDER	4
-#define XFS_WICACHE_HANDOFF_PIPE_CHUNK	(1UL << 20)
-#define XFS_WICACHE_HANDOFF_PIPE_DEPTH	2
+#define XFS_STAGEIO_PIPE_CHUNK	(2UL << 20)
+#define XFS_STAGEIO_HANDOFF_ORDER	4
+#define XFS_STAGEIO_HANDOFF_PIPE_CHUNK	(1UL << 20)
+#define XFS_STAGEIO_HANDOFF_PIPE_DEPTH	2
 
-struct xfs_file_wicache_async_dio {
+struct xfs_file_stageio_async_dio {
 	struct completion	done;
 	struct kiocb		iocb;
 	struct iov_iter		iter;
@@ -1191,12 +1191,12 @@ struct xfs_file_wicache_async_dio {
 };
 
 static void
-xfs_file_wicache_dio_complete(
+xfs_file_stageio_dio_complete(
 	struct kiocb		*iocb,
 	long			ret)
 {
-	struct xfs_file_wicache_async_dio *dio = container_of(iocb,
-			struct xfs_file_wicache_async_dio, iocb);
+	struct xfs_file_stageio_async_dio *dio = container_of(iocb,
+			struct xfs_file_stageio_async_dio, iocb);
 
 	if (iocb->dio_complete)
 		dio->caller_complete = true;
@@ -1208,8 +1208,8 @@ xfs_file_wicache_dio_complete(
 }
 
 static void
-xfs_file_wicache_dio_submit(
-	struct xfs_file_wicache_async_dio *dio,
+xfs_file_stageio_dio_submit(
+	struct xfs_file_stageio_async_dio *dio,
 	struct file		*file,
 	struct bio_vec		*bvec,
 	unsigned int		nr,
@@ -1221,7 +1221,7 @@ xfs_file_wicache_dio_submit(
 
 	reinit_completion(&dio->done);
 	init_sync_kiocb(&dio->iocb, file);
-	dio->iocb.ki_complete = xfs_file_wicache_dio_complete;
+	dio->iocb.ki_complete = xfs_file_stageio_dio_complete;
 	dio->iocb.ki_flags |= IOCB_DIRECT | IOCB_DIO_CALLER_COMP;
 	dio->iocb.ki_pos = pos;
 	iov_iter_bvec(&dio->iter, ITER_SOURCE, bvec, nr, count);
@@ -1235,14 +1235,14 @@ xfs_file_wicache_dio_submit(
 	ret = xfs_file_dio_write(&dio->iocb, &dio->iter);
 	dio->submit_ns = ktime_get_ns() - dio->start_ns;
 	if (ret != -EIOCBQUEUED)
-		xfs_file_wicache_dio_complete(&dio->iocb, ret);
+		xfs_file_stageio_dio_complete(&dio->iocb, ret);
 }
 
 static ssize_t
-xfs_file_wicache_dio_finish(
+xfs_file_stageio_dio_finish(
 	struct kiocb		*iocb,
 	struct iov_iter		*from,
-	struct xfs_file_wicache_async_dio *dio)
+	struct xfs_file_stageio_async_dio *dio)
 {
 	u64			wait_start = ktime_get_ns();
 	u64			wait_ns;
@@ -1252,10 +1252,10 @@ xfs_file_wicache_dio_finish(
 		dio->ret = dio->iocb.dio_complete(dio->iocb.private);
 	dio->dio_ns = ktime_get_ns() - dio->start_ns;
 	wait_ns = ktime_get_ns() - wait_start;
-	xfs_wicache_record_middle_staged(dio->count, dio->dio_ns);
-	xfs_wicache_record_middle_dio(dio->count, dio->prepare_ns, 0,
+	xfs_stageio_record_middle_staged(dio->count, dio->dio_ns);
+	xfs_stageio_record_middle_dio(dio->count, dio->prepare_ns, 0,
 			dio->dio_ns, 0);
-	xfs_wicache_record_middle_async(dio->submit_ns, wait_ns);
+	xfs_stageio_record_middle_async(dio->submit_ns, wait_ns);
 	if (dio->ret > 0) {
 		iov_iter_advance(from, dio->ret);
 		iocb->ki_pos += dio->ret;
@@ -1263,8 +1263,8 @@ xfs_file_wicache_dio_finish(
 	return dio->ret;
 }
 
-struct xfs_file_wicache_handoff_batch {
-	struct xfs_file_wicache_async_dio dio;
+struct xfs_file_stageio_handoff_batch {
+	struct xfs_file_stageio_async_dio dio;
 	struct address_space	*mapping;
 	struct folio		**folios;
 	struct bio_vec		*bvec;
@@ -1278,8 +1278,8 @@ struct xfs_file_wicache_handoff_batch {
 };
 
 static void
-xfs_file_wicache_handoff_batch_release(
-	struct xfs_file_wicache_handoff_batch *batch)
+xfs_file_stageio_handoff_batch_release(
+	struct xfs_file_stageio_handoff_batch *batch)
 {
 	unsigned int		i;
 
@@ -1294,8 +1294,8 @@ xfs_file_wicache_handoff_batch_release(
 }
 
 static int
-xfs_file_wicache_handoff_batch_prepare(
-	struct xfs_file_wicache_handoff_batch *batch,
+xfs_file_stageio_handoff_batch_prepare(
+	struct xfs_file_stageio_handoff_batch *batch,
 	struct address_space	*mapping,
 	struct iov_iter		*from,
 	loff_t			pos,
@@ -1323,9 +1323,9 @@ xfs_file_wicache_handoff_batch_prepare(
 		u64 copy_start;
 
 		if (!((batch->index + pages) &
-		      ((1U << XFS_WICACHE_HANDOFF_ORDER) - 1)) &&
-		    nr_pages - pages >= (1U << XFS_WICACHE_HANDOFF_ORDER))
-			order = XFS_WICACHE_HANDOFF_ORDER;
+		      ((1U << XFS_STAGEIO_HANDOFF_ORDER) - 1)) &&
+		    nr_pages - pages >= (1U << XFS_STAGEIO_HANDOFF_ORDER))
+			order = XFS_STAGEIO_HANDOFF_ORDER;
 		folio = filemap_alloc_folio(batch->gfp, order);
 		if (!folio)
 			goto nomem;
@@ -1335,11 +1335,11 @@ xfs_file_wicache_handoff_batch_prepare(
 		if (copy_folio_from_iter_atomic(folio, 0, folio_size(folio),
 				from) != folio_size(folio)) {
 			copy_ns += ktime_get_ns() - copy_start;
-			xfs_wicache_record_middle_copy(pages << PAGE_SHIFT,
+			xfs_stageio_record_middle_copy(pages << PAGE_SHIFT,
 					copy_ns);
 			folio_put(folio);
 			batch->folios[batch->nr] = NULL;
-			xfs_file_wicache_handoff_batch_release(batch);
+			xfs_file_stageio_handoff_batch_release(batch);
 			return -EFAULT;
 		}
 		copy_ns += ktime_get_ns() - copy_start;
@@ -1349,17 +1349,17 @@ xfs_file_wicache_handoff_batch_prepare(
 		batch->nr++;
 		pages += folio_pages;
 	}
-	xfs_wicache_record_middle_copy(count, copy_ns);
+	xfs_stageio_record_middle_copy(count, copy_ns);
 	return 0;
 
 nomem:
-	xfs_file_wicache_handoff_batch_release(batch);
+	xfs_file_stageio_handoff_batch_release(batch);
 	return -ENOMEM;
 }
 
 static void
-xfs_file_wicache_handoff_batch_cache(
-	struct xfs_file_wicache_handoff_batch *batch,
+xfs_file_stageio_handoff_batch_cache(
+	struct xfs_file_stageio_handoff_batch *batch,
 	ssize_t			written)
 {
 	unsigned int		written_pages = written > 0 ?
@@ -1390,32 +1390,32 @@ xfs_file_wicache_handoff_batch_cache(
 		cached += folio_pages;
 		page_index += folio_pages;
 	}
-	xfs_wicache_record_clean_handoff(written > 0 ? written : 0, cached,
+	xfs_stageio_record_clean_handoff(written > 0 ? written : 0, cached,
 			conflicts, ktime_get_ns() - batch->start_ns);
 }
 
 static ssize_t
-xfs_file_wicache_handoff_batch_finish(
+xfs_file_stageio_handoff_batch_finish(
 	struct kiocb		*iocb,
 	struct iov_iter		*from,
-	struct xfs_file_wicache_handoff_batch *batch)
+	struct xfs_file_stageio_handoff_batch *batch)
 {
 	ssize_t			ret;
 
-	ret = xfs_file_wicache_dio_finish(iocb, from, &batch->dio);
-	xfs_file_wicache_handoff_batch_cache(batch, ret);
-	xfs_file_wicache_handoff_batch_release(batch);
+	ret = xfs_file_stageio_dio_finish(iocb, from, &batch->dio);
+	xfs_file_stageio_handoff_batch_cache(batch, ret);
+	xfs_file_stageio_handoff_batch_release(batch);
 	batch->active = false;
 	return ret;
 }
 
 static ssize_t
-xfs_file_wicache_dio_handoff_pipeline(
+xfs_file_stageio_dio_handoff_pipeline(
 	struct kiocb		*iocb,
 	struct iov_iter		*from,
 	size_t			count)
 {
-	struct xfs_file_wicache_handoff_batch *batches;
+	struct xfs_file_stageio_handoff_batch *batches;
 	struct address_space	*mapping = iocb->ki_filp->f_mapping;
 	struct iov_iter		copy_iter = *from;
 	loff_t			base = iocb->ki_pos;
@@ -1427,21 +1427,21 @@ xfs_file_wicache_dio_handoff_pipeline(
 	unsigned int		i;
 	ssize_t			ret;
 
-	batches = kcalloc(XFS_WICACHE_HANDOFF_PIPE_DEPTH,
+	batches = kcalloc(XFS_STAGEIO_HANDOFF_PIPE_DEPTH,
 			sizeof(*batches), GFP_NOFS);
 	if (!batches)
 		return -ENOMEM;
-	for (i = 0; i < XFS_WICACHE_HANDOFF_PIPE_DEPTH; i++)
+	for (i = 0; i < XFS_STAGEIO_HANDOFF_PIPE_DEPTH; i++)
 		init_completion(&batches[i].dio.done);
 
 	while (submitted < count) {
-		struct xfs_file_wicache_handoff_batch *batch =
-			&batches[sequence % XFS_WICACHE_HANDOFF_PIPE_DEPTH];
+		struct xfs_file_stageio_handoff_batch *batch =
+			&batches[sequence % XFS_STAGEIO_HANDOFF_PIPE_DEPTH];
 		size_t chunk;
 		ssize_t batch_ret;
 
 		if (batch->active) {
-			batch_ret = xfs_file_wicache_handoff_batch_finish(iocb, from,
+			batch_ret = xfs_file_stageio_handoff_batch_finish(iocb, from,
 					batch);
 			finished++;
 			if (batch_ret > 0)
@@ -1453,14 +1453,14 @@ xfs_file_wicache_dio_handoff_pipeline(
 		}
 
 		chunk = min_t(size_t, count - submitted,
-				XFS_WICACHE_HANDOFF_PIPE_CHUNK);
-		batch_ret = xfs_file_wicache_handoff_batch_prepare(batch, mapping,
+				XFS_STAGEIO_HANDOFF_PIPE_CHUNK);
+		batch_ret = xfs_file_stageio_handoff_batch_prepare(batch, mapping,
 				&copy_iter, base + submitted, chunk);
 		if (batch_ret) {
 			error = batch_ret;
 			break;
 		}
-		xfs_file_wicache_dio_submit(&batch->dio, iocb->ki_filp,
+		xfs_file_stageio_dio_submit(&batch->dio, iocb->ki_filp,
 				batch->bvec, batch->nr, batch->pos, batch->count,
 				ktime_get_ns() - batch->start_ns);
 		batch->active = true;
@@ -1469,11 +1469,11 @@ xfs_file_wicache_dio_handoff_pipeline(
 	}
 
 	while (finished < sequence) {
-		struct xfs_file_wicache_handoff_batch *batch =
-			&batches[finished % XFS_WICACHE_HANDOFF_PIPE_DEPTH];
+		struct xfs_file_stageio_handoff_batch *batch =
+			&batches[finished % XFS_STAGEIO_HANDOFF_PIPE_DEPTH];
 		ssize_t ret;
 
-		ret = xfs_file_wicache_handoff_batch_finish(iocb, from, batch);
+		ret = xfs_file_stageio_handoff_batch_finish(iocb, from, batch);
 		finished++;
 		if (ret > 0)
 			done += ret;
@@ -1487,15 +1487,15 @@ xfs_file_wicache_dio_handoff_pipeline(
 }
 
 static ssize_t
-xfs_file_wicache_dio_pipeline(
+xfs_file_stageio_dio_pipeline(
 	struct kiocb		*iocb,
 	struct iov_iter		*from,
 	size_t			count)
 {
 	struct xfs_inode	*ip = XFS_I(file_inode(iocb->ki_filp));
-	struct xfs_wicache_mount *wm = ip->i_mount->m_wicache;
-	struct xfs_file_wicache_async_dio dio;
-	struct xfs_wicache_dio_slot *slot;
+	struct xfs_stageio_mount *wm = ip->i_mount->m_stageio;
+	struct xfs_file_stageio_async_dio dio;
+	struct xfs_stageio_dio_slot *slot;
 	struct iov_iter		copy_iter = *from;
 	size_t			submitted = 0;
 	ssize_t			done = 0;
@@ -1505,14 +1505,14 @@ xfs_file_wicache_dio_pipeline(
 
 	init_completion(&dio.done);
 	start = ktime_get_ns();
-	slot = xfs_wicache_dio_slot_get(wm);
+	slot = xfs_stageio_dio_slot_get(wm);
 	if (IS_ERR(slot))
 		return PTR_ERR(slot);
 	while (submitted < count) {
 		/* Alternate two regions while the device owns the active one. */
 		size_t chunk = min_t(size_t, count - submitted,
-				XFS_WICACHE_PIPE_CHUNK);
-		size_t region = (submitted / XFS_WICACHE_PIPE_CHUNK) & 1;
+				XFS_STAGEIO_PIPE_CHUNK);
+		size_t region = (submitted / XFS_STAGEIO_PIPE_CHUNK) & 1;
 		size_t copied;
 		u64 copy_start;
 		u64 prepare_ns;
@@ -1520,8 +1520,8 @@ xfs_file_wicache_dio_pipeline(
 
 		copy_start = ktime_get_ns();
 		copied = copy_from_iter((char *)slot->data +
-				region * XFS_WICACHE_PIPE_CHUNK, chunk, &copy_iter);
-		xfs_wicache_record_middle_copy(copied,
+				region * XFS_STAGEIO_PIPE_CHUNK, chunk, &copy_iter);
+		xfs_stageio_record_middle_copy(copied,
 				ktime_get_ns() - copy_start);
 		if (copied != chunk) {
 			error = -EFAULT;
@@ -1530,7 +1530,7 @@ xfs_file_wicache_dio_pipeline(
 		prepare_ns = ktime_get_ns() - start;
 
 		if (active) {
-			ret = xfs_file_wicache_dio_finish(iocb, from,
+			ret = xfs_file_stageio_dio_finish(iocb, from,
 					&dio);
 			active = false;
 			if (ret > 0)
@@ -1541,9 +1541,9 @@ xfs_file_wicache_dio_pipeline(
 			}
 		}
 
-		xfs_file_wicache_dio_submit(&dio, iocb->ki_filp,
+		xfs_file_stageio_dio_submit(&dio, iocb->ki_filp,
 				slot->bvec + region *
-				(XFS_WICACHE_PIPE_CHUNK >> PAGE_SHIFT),
+				(XFS_STAGEIO_PIPE_CHUNK >> PAGE_SHIFT),
 				chunk >> PAGE_SHIFT,
 				iocb->ki_pos, chunk, prepare_ns);
 		active = true;
@@ -1553,7 +1553,7 @@ xfs_file_wicache_dio_pipeline(
 
 out_finish:
 	if (active) {
-		ssize_t finish_ret = xfs_file_wicache_dio_finish(iocb,
+		ssize_t finish_ret = xfs_file_stageio_dio_finish(iocb,
 				from, &dio);
 
 		if (finish_ret > 0)
@@ -1563,19 +1563,19 @@ out_finish:
 	}
 
 out_put:
-	xfs_wicache_dio_slot_put(wm, slot);
+	xfs_stageio_dio_slot_put(wm, slot);
 	return error ? (done ? done : error) : done;
 }
 
 static ssize_t
-xfs_file_wicache_dio_chunk(
+xfs_file_stageio_dio_chunk(
 	struct kiocb		*iocb,
 	struct iov_iter		*from,
 	size_t			count)
 {
 	struct xfs_inode	*ip = XFS_I(file_inode(iocb->ki_filp));
-	struct xfs_wicache_mount *wm = ip->i_mount->m_wicache;
-	struct xfs_wicache_dio_slot *slot;
+	struct xfs_stageio_mount *wm = ip->i_mount->m_stageio;
+	struct xfs_stageio_dio_slot *slot;
 	struct iov_iter		part = *from;
 	unsigned int		nr = count >> PAGE_SHIFT;
 	size_t			copied;
@@ -1583,17 +1583,17 @@ xfs_file_wicache_dio_chunk(
 	u64			prepare_ns = 0, bvec_ns = 0;
 	u64			dio_ns = 0, release_ns = 0, start, copy_start;
 
-	if (xfs_wicache_user_dio_enabled() &&
-	    xfs_file_wicache_user_dio_aligned(iocb, from, count)) {
-		ret = xfs_file_wicache_user_dio_chunk(iocb, from, count,
+	if (xfs_stageio_user_dio_enabled() &&
+	    xfs_file_stageio_user_dio_aligned(iocb, from, count)) {
+		ret = xfs_file_stageio_user_dio_chunk(iocb, from, count,
 				&dio_ns);
-		xfs_wicache_record_middle_direct(count, dio_ns);
-		xfs_wicache_record_middle_dio(count, 0, 0, dio_ns, 0);
+		xfs_stageio_record_middle_direct(count, dio_ns);
+		xfs_stageio_record_middle_dio(count, 0, 0, dio_ns, 0);
 		return ret;
 	}
 
 	start = ktime_get_ns();
-	slot = xfs_wicache_dio_slot_get(wm);
+	slot = xfs_stageio_dio_slot_get(wm);
 	if (IS_ERR(slot)) {
 		ret = PTR_ERR(slot);
 		prepare_ns = ktime_get_ns() - start;
@@ -1602,7 +1602,7 @@ xfs_file_wicache_dio_chunk(
 	iov_iter_truncate(&part, count);
 	copy_start = ktime_get_ns();
 	copied = copy_from_iter(slot->data, count, &part);
-	xfs_wicache_record_middle_copy(copied,
+	xfs_stageio_record_middle_copy(copied,
 			ktime_get_ns() - copy_start);
 	if (copied != count) {
 		ret = -EFAULT;
@@ -1610,9 +1610,9 @@ xfs_file_wicache_dio_chunk(
 		goto out_put;
 	}
 	prepare_ns = ktime_get_ns() - start;
-	ret = xfs_wicache_dio_write_bvecs_timed(iocb->ki_filp,
+	ret = xfs_stageio_dio_write_bvecs_timed(iocb->ki_filp,
 			iocb->ki_pos, slot->bvec, nr, count, &dio_ns);
-	xfs_wicache_record_middle_staged(count, dio_ns);
+	xfs_stageio_record_middle_staged(count, dio_ns);
 	if (ret > 0) {
 		iov_iter_advance(from, ret);
 		iocb->ki_pos += ret;
@@ -1620,21 +1620,21 @@ xfs_file_wicache_dio_chunk(
 
 out_put:
 	start = ktime_get_ns();
-	xfs_wicache_dio_slot_put(wm, slot);
+	xfs_stageio_dio_slot_put(wm, slot);
 	release_ns = ktime_get_ns() - start;
 out_record:
-	xfs_wicache_record_middle_dio(count, prepare_ns, bvec_ns, dio_ns,
+	xfs_stageio_record_middle_dio(count, prepare_ns, bvec_ns, dio_ns,
 			release_ns);
 	return ret;
 }
 
 static ssize_t
-xfs_file_wicache_dio_handoff_chunk(
+xfs_file_stageio_dio_handoff_chunk(
 	struct kiocb		*iocb,
 	struct iov_iter		*from,
 	size_t			count)
 {
-	struct xfs_file_wicache_handoff_batch batch = { };
+	struct xfs_file_stageio_handoff_batch batch = { };
 	struct iov_iter		part = *from;
 	loff_t			pos = iocb->ki_pos;
 	ssize_t			ret;
@@ -1642,26 +1642,26 @@ xfs_file_wicache_dio_handoff_chunk(
 	u64			dio_ns = 0;
 
 	iov_iter_truncate(&part, count);
-	ret = xfs_file_wicache_handoff_batch_prepare(&batch,
+	ret = xfs_file_stageio_handoff_batch_prepare(&batch,
 			iocb->ki_filp->f_mapping, &part, pos, count);
 	if (ret)
 		return ret;
 	prepare_ns = ktime_get_ns() - batch.start_ns;
-	ret = xfs_wicache_dio_write_bvecs_timed(iocb->ki_filp, pos,
+	ret = xfs_stageio_dio_write_bvecs_timed(iocb->ki_filp, pos,
 			batch.bvec, batch.nr, count, &dio_ns);
-	xfs_wicache_record_middle_staged(count, dio_ns);
+	xfs_stageio_record_middle_staged(count, dio_ns);
 	if (ret > 0) {
 		iov_iter_advance(from, ret);
 		iocb->ki_pos += ret;
 	}
-	xfs_file_wicache_handoff_batch_cache(&batch, ret);
-	xfs_file_wicache_handoff_batch_release(&batch);
-	xfs_wicache_record_middle_dio(count, prepare_ns, 0, dio_ns, 0);
+	xfs_file_stageio_handoff_batch_cache(&batch, ret);
+	xfs_file_stageio_handoff_batch_release(&batch);
+	xfs_stageio_record_middle_dio(count, prepare_ns, 0, dio_ns, 0);
 	return ret;
 }
 
 static ssize_t
-xfs_file_wicache_dio_part(
+xfs_file_stageio_dio_part(
 	struct kiocb		*iocb,
 	struct iov_iter		*from,
 	size_t			count)
@@ -1669,15 +1669,15 @@ xfs_file_wicache_dio_part(
 	size_t			done = 0;
 	ssize_t			ret;
 
-	if (xfs_wicache_clean_handoff_enabled()) {
-		if (xfs_wicache_clean_handoff_async_enabled())
-			return xfs_file_wicache_dio_handoff_pipeline(iocb,
+	if (xfs_stageio_clean_handoff_enabled()) {
+		if (xfs_stageio_clean_handoff_async_enabled())
+			return xfs_file_stageio_dio_handoff_pipeline(iocb,
 					from, count);
 		while (done < count) {
 			size_t chunk = min_t(size_t, count - done,
-					XFS_WICACHE_DIO_CHUNK);
+					XFS_STAGEIO_DIO_CHUNK);
 
-			ret = xfs_file_wicache_dio_handoff_chunk(iocb, from,
+			ret = xfs_file_stageio_dio_handoff_chunk(iocb, from,
 					chunk);
 			if (ret <= 0)
 				return done ? done : ret;
@@ -1689,16 +1689,16 @@ xfs_file_wicache_dio_part(
 	}
 
 	/* A second chunk is enough to overlap its copy with the first DIO. */
-	if (count > XFS_WICACHE_PIPE_CHUNK &&
-	    (!xfs_wicache_user_dio_enabled() ||
-	     !xfs_file_wicache_user_dio_aligned(iocb, from, count)))
-		return xfs_file_wicache_dio_pipeline(iocb, from, count);
+	if (count > XFS_STAGEIO_PIPE_CHUNK &&
+	    (!xfs_stageio_user_dio_enabled() ||
+	     !xfs_file_stageio_user_dio_aligned(iocb, from, count)))
+		return xfs_file_stageio_dio_pipeline(iocb, from, count);
 
 	while (done < count) {
 		size_t chunk = min_t(size_t, count - done,
-				XFS_WICACHE_DIO_CHUNK);
+				XFS_STAGEIO_DIO_CHUNK);
 
-		ret = xfs_file_wicache_dio_chunk(iocb, from, chunk);
+		ret = xfs_file_stageio_dio_chunk(iocb, from, chunk);
 		if (ret <= 0)
 			return done ? done : ret;
 		done += ret;
@@ -1709,14 +1709,14 @@ xfs_file_wicache_dio_part(
 }
 
 static ssize_t
-xfs_file_wicache_write(
+xfs_file_stageio_write(
 	struct kiocb		*iocb,
 	struct iov_iter		*from)
 {
 	struct inode		*inode = iocb->ki_filp->f_mapping->host;
 	struct xfs_inode	*ip = XFS_I(inode);
-	struct xfs_wicache_mount *wm = ip->i_mount->m_wicache;
-	struct xfs_wicache_inode *wi;
+	struct xfs_stageio_mount *wm = ip->i_mount->m_stageio;
+	struct xfs_stageio_inode *wi;
 	struct mutex		*admission;
 	unsigned int		iolock = XFS_IOLOCK_SHARED;
 	loff_t			pos;
@@ -1736,30 +1736,30 @@ xfs_file_wicache_write(
 	pos = iocb->ki_pos;
 	aligned = IS_ALIGNED(pos, PAGE_SIZE) &&
 		  IS_ALIGNED(count, PAGE_SIZE);
-	small_write = count <= XFS_WICACHE_SMALL_WRITE_MAX;
-	admission = xfs_wicache_admission_lock(wm, ip);
+	small_write = count <= XFS_STAGEIO_SMALL_WRITE_MAX;
+	admission = xfs_stageio_admission_lock(wm, ip);
 	mutex_lock(admission);
-	wi = xfs_wicache_inode_lookup(wm, ip);
-	has_entry = wi && xfs_wicache_range_has_entry(wi, pos, count);
+	wi = xfs_stageio_inode_lookup(wm, ip);
+	has_entry = wi && xfs_stageio_range_has_entry(wi, pos, count);
 	if (has_entry && wi &&
-	    xfs_wicache_range_has_large_folio(wi, pos, count)) {
+	    xfs_stageio_range_has_large_folio(wi, pos, count)) {
 		loff_t drain_start = round_down(pos,
-				PAGE_SIZE << XFS_WICACHE_HANDOFF_ORDER);
+				PAGE_SIZE << XFS_STAGEIO_HANDOFF_ORDER);
 		loff_t drain_end = round_up(pos + count,
-				PAGE_SIZE << XFS_WICACHE_HANDOFF_ORDER);
+				PAGE_SIZE << XFS_STAGEIO_HANDOFF_ORDER);
 
-		ret = xfs_wicache_range_drain(wi, drain_start,
+		ret = xfs_stageio_range_drain(wi, drain_start,
 				drain_end - drain_start);
 		if (ret)
 			goto out_admission;
 		has_entry = false;
 	}
-	if (!xfs_wicache_can_stage(iocb, from) ||
+	if (!xfs_stageio_can_stage(iocb, from) ||
 	    xfs_has_wsync(ip->i_mount) || IS_SYNC(inode) ||
 	    xfs_is_cow_inode(ip) ||
 	    (!aligned && pos + count > i_size_read(inode))) {
 		if (has_entry) {
-			ret = xfs_wicache_range_drain(wi, pos, count);
+			ret = xfs_stageio_range_drain(wi, pos, count);
 			if (ret)
 				goto out_admission;
 		}
@@ -1772,9 +1772,9 @@ xfs_file_wicache_write(
 	}
 	/* Keep complete-page writes out of the dirty page cache. */
 	if (aligned && !small_write &&
-	    !xfs_wicache_clean_handoff_writebehind_enabled()) {
+	    !xfs_stageio_clean_handoff_writebehind_enabled()) {
 		if (has_entry) {
-			ret = xfs_wicache_range_drain(wi, pos, count);
+			ret = xfs_stageio_range_drain(wi, pos, count);
 			if (ret)
 				goto out_admission;
 		}
@@ -1782,12 +1782,12 @@ xfs_file_wicache_write(
 			ret = -EFAULT;
 			goto out_admission;
 		}
-		ret = xfs_file_wicache_dio_part(iocb, from, count);
+		ret = xfs_file_stageio_dio_part(iocb, from, count);
 		goto out_admission;
 	}
 	if (has_entry && !small_write &&
 	    offset_in_page(pos) + count > PAGE_SIZE) {
-		ret = xfs_wicache_range_drain(wi, pos, count);
+		ret = xfs_stageio_range_drain(wi, pos, count);
 		if (ret)
 			goto out_admission;
 		has_entry = false;
@@ -1798,27 +1798,27 @@ xfs_file_wicache_write(
 	}
 	start = ktime_get_ns();
 	ret = xfs_ilock_iocb(iocb, iolock);
-	xfs_wicache_record_front_iolock(ktime_get_ns() - start);
+	xfs_stageio_record_front_iolock(ktime_get_ns() - start);
 	if (ret)
 		goto out_admission;
 
 	start = ktime_get_ns();
-	written = xfs_file_wicache_written(ip, pos, count);
+	written = xfs_file_stageio_written(ip, pos, count);
 	if (has_entry && !written) {
-		xfs_wicache_record_mapping_check(ktime_get_ns() - start);
+		xfs_stageio_record_mapping_check(ktime_get_ns() - start);
 		ret = -EAGAIN;
 		goto out_unlock;
 	}
 	if (!has_entry && !written) {
-		xfs_wicache_record_mapping_check(ktime_get_ns() - start);
+		xfs_stageio_record_mapping_check(ktime_get_ns() - start);
 		xfs_iunlock(ip, iolock);
 		iolock = 0;
 		ret = xfs_file_buffered_write(iocb, from);
 		goto out_admission;
 	}
-	xfs_wicache_record_mapping_check(ktime_get_ns() - start);
+	xfs_stageio_record_mapping_check(ktime_get_ns() - start);
 	if (!wi) {
-		wi = xfs_wicache_inode_get_or_create(wm, ip, GFP_NOFS);
+		wi = xfs_stageio_inode_get_or_create(wm, ip, GFP_NOFS);
 		if (IS_ERR(wi)) {
 			xfs_iunlock(ip, iolock);
 			iolock = 0;
@@ -1833,7 +1833,7 @@ xfs_file_wicache_write(
 		goto out_unlock;
 	pos = iocb->ki_pos;
 	count = iov_iter_count(from);
-	if (!xfs_wicache_can_stage(iocb, from)) {
+	if (!xfs_stageio_can_stage(iocb, from)) {
 		if (has_entry) {
 			ret = -EAGAIN;
 			goto out_unlock;
@@ -1845,23 +1845,23 @@ xfs_file_wicache_write(
 	}
 	xfs_iunlock(ip, iolock);
 	iolock = 0;
-	if (xfs_wicache_clean_handoff_writebehind_enabled()) {
-		ret = xfs_file_wicache_stage_part(wi, iocb, from, count, true);
+	if (xfs_stageio_clean_handoff_writebehind_enabled()) {
+		ret = xfs_file_stageio_stage_part(wi, iocb, from, count, true);
 		goto out_admission;
 	}
 	if (small_write) {
-		ret = xfs_file_wicache_stage_part(wi, iocb, from, count, true);
+		ret = xfs_file_stageio_stage_part(wi, iocb, from, count, true);
 		goto out_admission;
 	}
 
-	io_unit = xfs_wicache_io_unit_bytes();
+	io_unit = xfs_stageio_io_unit_bytes();
 	head = (pos & (io_unit - 1)) ?
 		min_t(size_t, count, io_unit - (pos & (io_unit - 1))) : 0;
 	middle = round_down(count - head, io_unit);
 	tail = count - head - middle;
 
 	if (head) {
-		ret = xfs_file_wicache_stage_part(wi, iocb, from, head, false);
+		ret = xfs_file_stageio_stage_part(wi, iocb, from, head, false);
 		if (ret <= 0)
 			goto out_admission;
 		done += ret;
@@ -1869,7 +1869,7 @@ xfs_file_wicache_write(
 			goto out_partial;
 	}
 	if (middle) {
-		ret = xfs_file_wicache_dio_part(iocb, from, middle);
+		ret = xfs_file_stageio_dio_part(iocb, from, middle);
 		if (ret <= 0)
 			goto out_partial;
 		done += ret;
@@ -1877,7 +1877,7 @@ xfs_file_wicache_write(
 			goto out_partial;
 	}
 	if (tail) {
-		ret = xfs_file_wicache_stage_part(wi, iocb, from, tail, false);
+		ret = xfs_file_stageio_stage_part(wi, iocb, from, tail, false);
 		if (ret <= 0)
 			goto out_partial;
 		done += ret;
@@ -1895,10 +1895,10 @@ out_unlock:
 		xfs_iunlock(ip, iolock);
 out_admission:
 	mutex_unlock(admission);
-	xfs_wicache_inode_put(wi);
+	xfs_stageio_inode_put(wi);
 	return ret;
 }
-#endif /* USE_WICACHE */
+#endif /* USE_STAGEIO */
 
 STATIC ssize_t
 xfs_file_write_iter(
@@ -1921,12 +1921,12 @@ xfs_file_write_iter(
 	if (IS_DAX(inode))
 		return xfs_file_dax_write(iocb, from);
 
-#ifdef USE_WICACHE
+#ifdef USE_STAGEIO
 	/*
 	 * Check the overlay before direct and unsupported buffered writes so
 	 * that an overlapping request cannot bypass an existing dirty entry.
 	 */
-	ret = xfs_file_wicache_write(iocb, from);
+	ret = xfs_file_stageio_write(iocb, from);
 	if (ret != -EOPNOTSUPP)
 		return ret;
 #endif

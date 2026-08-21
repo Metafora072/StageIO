@@ -34,7 +34,7 @@
 #include "xfs_health.h"
 #include "xfs_trace.h"
 #include "xfs_ag.h"
-#include "xfs_wicache.h"
+#include "xfs_stageio.h"
 #include "scrub/stats.h"
 
 static DEFINE_MUTEX(xfs_uuid_table_mutex);
@@ -985,11 +985,11 @@ xfs_mountfs(
 			goto out_agresv;
 	}
 
-#ifdef USE_WICACHE
-	mp->m_wicache = xfs_wicache_mount_alloc(GFP_KERNEL);
-	if (IS_ERR(mp->m_wicache)) {
-		xfs_warn(mp, "WICache init failed, continue with native buffered I/O.");
-		mp->m_wicache = NULL;
+#ifdef USE_STAGEIO
+	mp->m_stageio = xfs_stageio_mount_alloc(GFP_KERNEL);
+	if (IS_ERR(mp->m_stageio)) {
+		xfs_warn(mp, "StageIO init failed, continue with native buffered I/O.");
+		mp->m_stageio = NULL;
 	}
 #endif
 
@@ -1082,9 +1082,9 @@ xfs_unmountfs(
 
 	xfs_qm_unmount(mp);
 
-#ifdef USE_WICACHE
-	xfs_wicache_mount_free(mp->m_wicache);
-	mp->m_wicache = NULL;
+#ifdef USE_STAGEIO
+	xfs_stageio_mount_free(mp->m_stageio);
+	mp->m_stageio = NULL;
 #endif
 
 	/*
