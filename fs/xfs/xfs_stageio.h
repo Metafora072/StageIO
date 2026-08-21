@@ -205,9 +205,9 @@ void xfs_stageio_record_front_iolock(u64 ns);
 void xfs_stageio_record_mapping_check(u64 ns);
 unsigned long xfs_stageio_io_unit_bytes(void);
 bool xfs_stageio_user_dio_enabled(void);
-bool xfs_stageio_clean_handoff_enabled(void);
-bool xfs_stageio_clean_handoff_async_enabled(void);
-bool xfs_stageio_clean_handoff_writebehind_enabled(void);
+bool xfs_stageio_legacy_pagecache_handoff_enabled(void);
+bool xfs_stageio_legacy_pagecache_handoff_async_enabled(void);
+bool xfs_stageio_unified_staging_enabled(void);
 void xfs_stageio_record_middle_dio(size_t bytes, u64 prepare_ns,
 		u64 bvec_ns, u64 dio_ns, u64 release_ns);
 void xfs_stageio_record_middle_copy(size_t bytes, u64 copy_ns);

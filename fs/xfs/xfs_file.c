@@ -1669,8 +1669,8 @@ xfs_file_stageio_dio_part(
 	size_t			done = 0;
 	ssize_t			ret;
 
-	if (xfs_stageio_clean_handoff_enabled()) {
-		if (xfs_stageio_clean_handoff_async_enabled())
+	if (xfs_stageio_legacy_pagecache_handoff_enabled()) {
+		if (xfs_stageio_legacy_pagecache_handoff_async_enabled())
 			return xfs_file_stageio_dio_handoff_pipeline(iocb,
 					from, count);
 		while (done < count) {
@@ -1772,7 +1772,7 @@ xfs_file_stageio_write(
 	}
 	/* Keep complete-page writes out of the dirty page cache. */
 	if (aligned && !small_write &&
-	    !xfs_stageio_clean_handoff_writebehind_enabled()) {
+	    !xfs_stageio_unified_staging_enabled()) {
 		if (has_entry) {
 			ret = xfs_stageio_range_drain(wi, pos, count);
 			if (ret)
@@ -1845,7 +1845,7 @@ xfs_file_stageio_write(
 	}
 	xfs_iunlock(ip, iolock);
 	iolock = 0;
-	if (xfs_stageio_clean_handoff_writebehind_enabled()) {
+	if (xfs_stageio_unified_staging_enabled()) {
 		ret = xfs_file_stageio_stage_part(wi, iocb, from, count, true);
 		goto out_admission;
 	}

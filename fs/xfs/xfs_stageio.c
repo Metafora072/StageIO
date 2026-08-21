@@ -32,10 +32,10 @@ static unsigned int xfs_stageio_delay_ms = 1;
 static unsigned long xfs_stageio_high_bytes = 256UL << 20;
 static unsigned long xfs_stageio_io_unit = PAGE_SIZE;
 static bool xfs_stageio_user_dio = true;
-static bool xfs_stageio_clean_handoff;
-static bool xfs_stageio_clean_handoff_async;
-static bool xfs_stageio_clean_handoff_writebehind;
-static bool xfs_stageio_clean_recent;
+static bool xfs_stageio_legacy_pagecache_handoff;
+static bool xfs_stageio_legacy_pagecache_handoff_async;
+static bool xfs_stageio_unified_staging = true;
+static bool xfs_stageio_clean_recent = true;
 static bool xfs_stageio_clean_access_aware = true;
 static bool xfs_stageio_clean_reuse = true;
 static unsigned long xfs_stageio_clean_recent_inode_bytes = 32UL << 20;
@@ -165,20 +165,23 @@ MODULE_PARM_DESC(stageio_delay_ms, "Dirty accumulation delay in milliseconds");
 module_param_named(stageio_high_bytes, xfs_stageio_high_bytes, ulong, 0444);
 MODULE_PARM_DESC(stageio_high_bytes, "Sparse overlay payload high watermark");
 module_param_named(stageio_io_unit, xfs_stageio_io_unit, ulong, 0444);
-MODULE_PARM_DESC(stageio_io_unit, "Buffered fragment and direct I/O split unit");
+MODULE_PARM_DESC(stageio_io_unit,
+		"Fragment and direct I/O unit in the legacy split path");
 module_param_named(stageio_user_dio, xfs_stageio_user_dio, bool, 0444);
-MODULE_PARM_DESC(stageio_user_dio, "Use aligned user iterators for middle DIO");
-module_param_named(stageio_clean_handoff, xfs_stageio_clean_handoff, bool, 0444);
-MODULE_PARM_DESC(stageio_clean_handoff,
-		"Keep successful middle DIO folios as clean page cache");
-module_param_named(stageio_clean_handoff_async,
-		xfs_stageio_clean_handoff_async, bool, 0444);
-MODULE_PARM_DESC(stageio_clean_handoff_async,
-		"Pipeline clean handoff folios through asynchronous middle DIO");
-module_param_named(stageio_clean_handoff_writebehind,
-		xfs_stageio_clean_handoff_writebehind, bool, 0444);
-MODULE_PARM_DESC(stageio_clean_handoff_writebehind,
-		"Return after submitting ordered clean handoff DIO");
+MODULE_PARM_DESC(stageio_user_dio,
+		"Use aligned user iterators in the legacy split path");
+module_param_named(stageio_legacy_pagecache_handoff,
+		xfs_stageio_legacy_pagecache_handoff, bool, 0444);
+MODULE_PARM_DESC(stageio_legacy_pagecache_handoff,
+		"Legacy experiment: publish successful middle DIO to page cache");
+module_param_named(stageio_legacy_pagecache_handoff_async,
+		xfs_stageio_legacy_pagecache_handoff_async, bool, 0444);
+MODULE_PARM_DESC(stageio_legacy_pagecache_handoff_async,
+		"Legacy experiment: pipeline page-cache handoff DIO");
+module_param_named(stageio_unified_staging,
+		xfs_stageio_unified_staging, bool, 0444);
+MODULE_PARM_DESC(stageio_unified_staging,
+		"Stage every supported buffered write before background DIO");
 module_param_named(stageio_clean_recent, xfs_stageio_clean_recent,
 		bool, 0444);
 MODULE_PARM_DESC(stageio_clean_recent,
@@ -219,21 +222,21 @@ xfs_stageio_user_dio_enabled(void)
 }
 
 bool
-xfs_stageio_clean_handoff_enabled(void)
+xfs_stageio_legacy_pagecache_handoff_enabled(void)
 {
-	return xfs_stageio_clean_handoff;
+	return xfs_stageio_legacy_pagecache_handoff;
 }
 
 bool
-xfs_stageio_clean_handoff_async_enabled(void)
+xfs_stageio_legacy_pagecache_handoff_async_enabled(void)
 {
-	return xfs_stageio_clean_handoff_async;
+	return xfs_stageio_legacy_pagecache_handoff_async;
 }
 
 bool
-xfs_stageio_clean_handoff_writebehind_enabled(void)
+xfs_stageio_unified_staging_enabled(void)
 {
-	return xfs_stageio_clean_handoff_writebehind;
+	return xfs_stageio_unified_staging;
 }
 
 static int
@@ -360,13 +363,13 @@ module_param_cb(stageio_middle_async_submit_ns, &xfs_stageio_atomic64_ops,
 		&xfs_stageio_global_middle_async_submit_ns, 0444);
 module_param_cb(stageio_middle_async_wait_ns, &xfs_stageio_atomic64_ops,
 		&xfs_stageio_global_middle_async_wait_ns, 0444);
-module_param_cb(stageio_clean_handoff_bytes, &xfs_stageio_atomic64_ops,
+module_param_cb(stageio_legacy_pagecache_handoff_bytes, &xfs_stageio_atomic64_ops,
 		&xfs_stageio_global_clean_handoff_bytes, 0444);
-module_param_cb(stageio_clean_handoff_pages, &xfs_stageio_atomic64_ops,
+module_param_cb(stageio_legacy_pagecache_handoff_pages, &xfs_stageio_atomic64_ops,
 		&xfs_stageio_global_clean_handoff_pages, 0444);
-module_param_cb(stageio_clean_handoff_conflicts, &xfs_stageio_atomic64_ops,
+module_param_cb(stageio_legacy_pagecache_handoff_conflicts, &xfs_stageio_atomic64_ops,
 		&xfs_stageio_global_clean_handoff_conflicts, 0444);
-module_param_cb(stageio_clean_handoff_ns, &xfs_stageio_atomic64_ops,
+module_param_cb(stageio_legacy_pagecache_handoff_ns, &xfs_stageio_atomic64_ops,
 		&xfs_stageio_global_clean_handoff_ns, 0444);
 module_param_cb(stageio_async_handoff_queued_bytes,
 		&xfs_stageio_atomic64_ops,
@@ -1356,14 +1359,41 @@ xfs_stageio_take_one_clean(
 	struct xfs_stageio_mount *wm)
 {
 	struct xfs_stageio_raw_batch *batch;
+	s64			scan_budget, scanned = 0;
 
 	mutex_lock(&wm->clean_lock);
 	if (list_empty(&wm->clean_batches)) {
 		mutex_unlock(&wm->clean_lock);
 		return NULL;
 	}
-	batch = list_first_entry(&wm->clean_batches,
-			struct xfs_stageio_raw_batch, clean_node);
+	scan_budget = atomic64_read(&wm->clean_bytes);
+	for (;;) {
+		int state;
+
+		batch = list_first_entry(&wm->clean_batches,
+				struct xfs_stageio_raw_batch, clean_node);
+		if (!xfs_stageio_clean_access_aware)
+			break;
+		if (scanned >= scan_budget) {
+			/* A bounded revolution guarantees progress if all are hot. */
+			atomic64_inc(
+				&xfs_stageio_global_clean_forced_evictions);
+			break;
+		}
+		state = atomic_read(&batch->clean_access_state);
+		if (state != XFS_STAGEIO_CLEAN_PROTECTED_HOT)
+			break;
+		if (atomic_cmpxchg(&batch->clean_access_state,
+				XFS_STAGEIO_CLEAN_PROTECTED_HOT,
+				XFS_STAGEIO_CLEAN_PROTECTED_COLD) !=
+		    XFS_STAGEIO_CLEAN_PROTECTED_HOT)
+			continue;
+		list_move_tail(&batch->clean_node, &wm->clean_batches);
+		list_move_tail(&batch->clean_inode_node,
+				&batch->wi->clean_batches);
+		scanned += batch->clean_bytes;
+		atomic64_inc(&xfs_stageio_global_clean_second_chances);
+	}
 	list_del_init(&batch->clean_node);
 	list_del_init(&batch->clean_inode_node);
 	atomic64_sub(batch->clean_bytes, &wm->clean_bytes);
@@ -2372,9 +2402,11 @@ xfs_stageio_mount_alloc(
 		goto out_persist;
 	}
 	xfs_stageio_reset_stats();
-	error = xfs_stageio_dio_pool_init(wm, gfp);
-	if (error)
-		goto out_handoff;
+	if (!xfs_stageio_unified_staging) {
+		error = xfs_stageio_dio_pool_init(wm, gfp);
+		if (error)
+			goto out_handoff;
+	}
 	return wm;
 
 out_handoff:
@@ -3416,7 +3448,7 @@ retry_entry:
 	atomic64_add(written, &xfs_stageio_global_accepted_bytes);
 	atomic64_add(written, &wi->dirty_bytes);
 	if (written) {
-		delay = xfs_stageio_clean_handoff_writebehind_enabled() ? 0 :
+		delay = xfs_stageio_unified_staging_enabled() ? 0 :
 			msecs_to_jiffies(xfs_stageio_delay_ms);
 		if (atomic64_read(&wi->wm->total_dirty_bytes) >=
 		    xfs_stageio_high_bytes * 3 / 4)
@@ -4546,7 +4578,7 @@ xfs_stageio_finish_entry(
 	if (remove)
 		xfs_stageio_remove_entry(entry);
 	if (remove && folio && owned_file &&
-	    xfs_stageio_clean_handoff_enabled())
+	    xfs_stageio_legacy_pagecache_handoff_enabled())
 		xfs_stageio_publish_clean_folio(owned_file->f_mapping,
 				entry->page_index, folio);
 
@@ -4593,8 +4625,8 @@ xfs_stageio_finish_raw_item(
 					item->clean_recent = true;
 					clean_recent = true;
 				}
-			} else if (xfs_stageio_clean_handoff_enabled() &&
-			    xfs_stageio_clean_handoff_async_enabled()) {
+			} else if (xfs_stageio_legacy_pagecache_handoff_enabled() &&
+			    xfs_stageio_legacy_pagecache_handoff_async_enabled()) {
 				xas_clear_mark(&xas,
 						XFS_STAGEIO_XA_FLUSHING);
 				item->handoff = true;
@@ -4618,7 +4650,7 @@ xfs_stageio_finish_raw_item(
 			xfs_stageio_uncharge(wi->wm, bytes);
 	}
 	if (removed) {
-		if (xfs_stageio_clean_handoff_enabled())
+		if (xfs_stageio_legacy_pagecache_handoff_enabled())
 			xfs_stageio_publish_clean_folio(batch->file->f_mapping,
 					item->page_index, item->folio);
 		atomic64_dec(&wi->nr_entries);
